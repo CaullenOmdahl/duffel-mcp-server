@@ -4,143 +4,92 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains a Duffel MCP (Model Context Protocol) server that enables LLMs to search for flights, retrieve offers, and create bookings through the Duffel flight booking API. It includes intelligent optimization strategies for finding the cheapest, fastest, or best overall flights.
+Duffel MCP server that enables LLMs to search for flights, retrieve offers, and create bookings through the Duffel flight booking API. Single-file FastMCP server with intelligent optimization strategies.
 
-## Running the Server
+## Commands
 
 ```bash
-# Run with default stdio transport
+# Install dependencies
+pip install fastmcp httpx pydantic
+# Or with uv
+uv pip install -e duffel_mcp/
+
+# Run server (stdio transport - default for CLI)
 python duffel_mcp/server.py
 
-# Run with SSE transport for web deployments
-python duffel_mcp/server.py --transport sse --host 0.0.0.0 --port 8000
+# Run server (SSE transport - for web/Railway deployment)
+python duffel_mcp/server.py --transport sse --host 0.0.0.0 --port 8080
 
 # Enable debug logging
 python duffel_mcp/server.py --debug
 
-# Or run with uv
-uv --directory duffel_mcp run python server.py
+# Test API key permissions
+DUFFEL_API_KEY_LIVE="your_key" python duffel_mcp/test_api_key.py
+
+# Docker build & run
+docker build -t duffel-mcp .
+docker run -p 8080:8080 -e DUFFEL_API_KEY_LIVE=xxx duffel-mcp
 ```
-
-## Testing API Key Permissions
-
-```bash
-python duffel_mcp/test_api_key.py
-```
-
-This verifies the Duffel API key has required permissions: `air.offer_requests.create`, `air.offers.read`, `air.orders.create`, `air.airlines.read`.
 
 ## Architecture
 
-### MCP Server (`duffel_mcp/server.py`)
+### Core Components (`duffel_mcp/server.py`)
 
-Single-file FastMCP server built with:
-- **FastMCP** framework with lifespan management for persistent HTTP client
-- **Pydantic v2** models for input validation
-- **httpx** async client with connection reuse
-- **Context injection** for progress reporting and logging
+**Single-file server** (~1750 lines) containing:
+- Pydantic v2 input models for all tools (lines 164-443)
+- Optimization/scoring logic in `calculate_flight_score()` (lines 614-651)
+- 6 MCP tools, 4 resources, 3 prompts
 
-### Tools Provided
-
-| Tool | Purpose |
-|------|---------|
-| `duffel_search_flights` | Search for flights with optimization strategies |
-| `duffel_analyze_offers` | Analyze and rank offers from a previous search |
-| `duffel_get_offer` | Get latest details for a specific offer |
-| `duffel_list_offers` | List/filter offers from a previous search |
-| `duffel_create_order` | Book a flight with passenger and payment details |
-| `duffel_list_airlines` | Reference data for available airlines |
-
-### Resources
-
-| URI | Description |
-|-----|-------------|
-| `duffel://airlines` | List of all available airlines |
-| `duffel://airlines/{code}` | Details for a specific airline by IATA code |
-| `duffel://places/{query}` | Search airports and cities by name |
-
-### Prompts
-
-| Prompt | Description |
-|--------|-------------|
-| `book_round_trip` | Guided workflow for round-trip booking |
-| `find_cheapest` | Strategy for finding affordable options |
-| `compare_options` | Analyze and compare multiple flight options |
+**Key functions:**
+- `_make_api_request()`: Authenticated Duffel API calls
+- `_optimize_offers()`: Apply sorting/scoring strategies
+- `_handle_api_error()`: Consistent error formatting with HTTP status handling
 
 ### Optimization Strategies
 
-The search tool supports these strategies via the `optimization` parameter:
+The `optimization` parameter accepts: `none`, `cheapest`, `fastest`, `least_stops`, `best`, `earliest`, `latest`
 
-| Strategy | Description |
-|----------|-------------|
-| `none` | Return results as-is from API |
-| `cheapest` | Sort by price ascending |
-| `fastest` | Sort by total duration ascending |
-| `least_stops` | Sort by number of connections |
-| `best` | Weighted score algorithm |
-| `earliest` | Sort by departure time (morning first) |
-| `latest` | Sort by departure time (evening first) |
+The `best` strategy uses weighted scoring (default weights):
+- Price: 0.4, Duration: 0.3, Stops: 0.2, Departure Time: 0.1
 
-### Weighted Scoring (`best` strategy)
+### MCP Resources
 
-Default weights for the composite score (0-100):
-- **Price**: 0.4 (lower prices score higher)
-- **Duration**: 0.3 (shorter flights score higher)
-- **Stops**: 0.2 (fewer stops score higher)
-- **Departure Time**: 0.1 (match to preferred window)
-
-Customize via `optimization_weights` parameter with `OptimizationWeights` model.
-
-### Key Constants
-
-- `API_BASE_URL`: `https://api.duffel.com`
-- `API_VERSION`: `v2`
-- `CHARACTER_LIMIT`: 25000 (truncation limit for responses)
-- `DEFAULT_TIMEOUT`: 30.0 seconds
-
-### Response Formats
-
-All tools support two output formats via `response_format` parameter:
-- `markdown` (default): Human-readable formatted output with scores
-- `json`: Complete API response for programmatic processing
+- `duffel://airlines` - All available airlines
+- `duffel://airlines/{iata_code}` - Single airline by code
+- `duffel://places/{query}` - Airport/city search
+- `duffel://instructions` - AI agent guidelines for smart travel assistance
 
 ## Configuration
 
-The server requires `DUFFEL_API_KEY_LIVE` environment variable. MCP configuration is in `.mcp.json`.
+**Required:** `DUFFEL_API_KEY_LIVE` environment variable
 
-## Key Implementation Patterns
+The API key needs these permissions:
+- `air.offer_requests.create`
+- `air.offers.read`
+- `air.orders.create`
+- `air.airlines.read`
 
-### Lifespan Management
-Persistent HTTP client initialized at startup, reused for all requests:
-```python
-@asynccontextmanager
-async def app_lifespan(server: FastMCP):
-    async with httpx.AsyncClient(...) as client:
-        yield {"http_client": client}
-```
+MCP client config is in `.mcp.json`.
 
-### Context Injection
-All tools receive `ctx: Context` for progress reporting:
-```python
-await ctx.report_progress(0.5, "Searching for flights...")
-```
+## Deployment
 
-### Structured Logging
-All operations log to stderr (stdout reserved for MCP protocol):
-```python
-logger.info("Flight search: %s, %d passengers", route, count)
-logger.error("API error %s: %s", status, message)
-```
+**Railway:** Deploy via GitHub connection, uses `Dockerfile` with SSE transport on port 8080
+**Docker:** `Dockerfile` runs `server.py --transport sse --host 0.0.0.0 --port 8080`
 
-### Multiple Transports
-Supports stdio (default) and HTTP/SSE:
-```python
-mcp.run()  # stdio
-mcp.run(transport="sse", host="0.0.0.0", port=8000)  # HTTP/SSE
-```
+## Key Patterns
 
-### Error Handling
-Uses `ToolError` exception for proper `isError` flag handling. All errors are logged with context.
+- All logging goes to stderr (stdout reserved for MCP protocol)
+- Tools receive `ctx: Context` for `report_progress()` calls
+- `ToolError` exception sets MCP `isError` flag
+- Character limit: 25000 (responses truncated with `_truncate_if_needed()`)
 
-### Flight Scoring
-Offers are scored using normalized factors combined with configurable weights. The `calculate_flight_score()` function handles all scoring logic.
+## Technical Debt
+
+### Payment/Booking Flow
+- **Issue**: `duffel_create_order` requires payment details (card info) which can't be safely collected in chat
+- **Duffel has no hosted checkout** - no redirect URL like Stripe Checkout
+- **Options to fix**:
+  1. Switch to **hold orders** - reserve flight without payment, return booking details for user to pay elsewhere
+  2. Build a **separate payment page** with Stripe/Duffel Payments component, return URL to user
+  3. **Remove booking capability** - make this search/advisory only, direct users to airline sites
+- **Recommended**: Hold orders + clear instructions on how to complete payment

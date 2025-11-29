@@ -442,6 +442,55 @@ class ListAirlinesInput(BaseModel):
         description="Output format: 'markdown' or 'json'"
     )
 
+class FlexibleDateSearchInput(BaseModel):
+    """Input for searching flights across a range of dates to find the best deal."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    origin: str = Field(
+        ...,
+        description="Origin airport IATA code (e.g., 'SGN', 'JFK')",
+        min_length=3,
+        max_length=3
+    )
+    destination: str = Field(
+        ...,
+        description="Destination airport IATA code (e.g., 'KUL', 'LAX')",
+        min_length=3,
+        max_length=3
+    )
+    departure_date: str = Field(
+        ...,
+        description="Target departure date in YYYY-MM-DD format",
+        pattern=r'^\d{4}-\d{2}-\d{2}$'
+    )
+    return_date: Optional[str] = Field(
+        default=None,
+        description="Target return date in YYYY-MM-DD format (omit for one-way)",
+        pattern=r'^\d{4}-\d{2}-\d{2}$'
+    )
+    flexibility_days: int = Field(
+        default=3,
+        description="Number of days to search before and after target dates (+/- N days)",
+        ge=1,
+        le=7
+    )
+    passengers: List[PassengerInput] = Field(
+        default=[PassengerInput(type=PassengerType.ADULT)],
+        description="List of passengers (defaults to 1 adult)",
+        min_length=1,
+        max_length=9
+    )
+    cabin_class: Optional[CabinClass] = Field(
+        default=CabinClass.ECONOMY,
+        description="Cabin class preference"
+    )
+    max_connections: Optional[int] = Field(
+        default=None,
+        description="Maximum connections (0 for non-stop only)",
+        ge=0,
+        le=2
+    )
+
 # ============================================================================
 # Shared Utility Functions
 # ============================================================================
@@ -840,9 +889,29 @@ For each option, include relevant warnings inline:
 | User mentions "quick trip" | Note total travel times prominently |
 | User is vague about dates | Ask for approximate timeframe |
 
-## Optimization Strategies
+## Tool Selection Guide
 
-- `cheapest`: Find lowest price (search multiple dates!)
+| User Request | Tool to Use |
+|--------------|-------------|
+| "Cheapest flight to X" | `duffel_flexible_search` (searches +/- 3 days automatically) |
+| "Most affordable option" | `duffel_flexible_search` |
+| "Best deal" | `duffel_flexible_search` |
+| "Flights on specific date" | `duffel_search_flights` |
+| "Compare airlines" | `duffel_search_flights` with optimization |
+| "Details on an offer" | `duffel_get_offer` |
+
+## Key Tool: duffel_flexible_search
+
+**USE THIS** when user wants cheapest/most affordable/best deal.
+It automatically searches +/- N days and compares prices, saving you from doing multiple searches manually.
+
+Example: User says "cheapest flight to KL for Christmas"
+→ Use `duffel_flexible_search` with departure_date="2025-12-24", return_date="2025-12-26", flexibility_days=3
+→ Tool searches Dec 21-27 range and returns comparison with recommendations
+
+## Optimization Strategies (for duffel_search_flights)
+
+- `cheapest`: Find lowest price
 - `fastest`: Shortest total travel time
 - `best`: Balanced score (good for general "find me flights")
 - `least_stops`: Prioritize direct flights
@@ -1681,6 +1750,234 @@ async def duffel_list_airlines(params: ListAirlinesInput, ctx: Context) -> str:
         return _truncate_if_needed(result, "airlines")
 
     except Exception as e:
+        return _handle_api_error(e, ctx)
+
+@mcp.tool(
+    name="duffel_flexible_search",
+    annotations={
+        "title": "Flexible Date Flight Search",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) -> str:
+    """
+    Search for the cheapest flights across a range of dates.
+
+    USE THIS TOOL when the user wants the "cheapest", "most affordable", or "best deal"
+    on flights. It automatically searches multiple date combinations to find the
+    lowest price, then compares and presents the best options.
+
+    This is better than regular search when:
+    - User wants the cheapest option and has some date flexibility
+    - User says "around Christmas" or "sometime in December"
+    - User prioritizes price over specific dates
+
+    Args:
+        params: Contains origin, destination, target dates, and flexibility_days (+/- N days to search)
+
+    Returns:
+        Comparison of cheapest options found across all searched dates, with recommendations.
+    """
+    from datetime import datetime, timedelta
+
+    try:
+        logger.info(
+            "Flexible search: %s->%s, target %s (return: %s), +/-%d days",
+            params.origin, params.destination, params.departure_date,
+            params.return_date or "one-way", params.flexibility_days
+        )
+
+        await ctx.report_progress(0.1, "Preparing date combinations...")
+
+        # Parse target dates
+        target_dep = datetime.strptime(params.departure_date, "%Y-%m-%d")
+        target_ret = datetime.strptime(params.return_date, "%Y-%m-%d") if params.return_date else None
+        is_roundtrip = target_ret is not None
+
+        # Generate date combinations to search
+        date_combinations = []
+        flex = params.flexibility_days
+
+        if is_roundtrip:
+            # For round-trip: search combinations of departure and return dates
+            # Focus on key combinations to avoid too many API calls
+            for dep_offset in range(-flex, flex + 1):
+                dep_date = target_dep + timedelta(days=dep_offset)
+                # Keep same trip length, just shift dates
+                ret_date = target_ret + timedelta(days=dep_offset)
+                date_combinations.append((dep_date, ret_date))
+
+            # Also try original departure with flexible return
+            for ret_offset in [-2, -1, 1, 2]:
+                if ret_offset != 0:
+                    ret_date = target_ret + timedelta(days=ret_offset)
+                    if ret_date > target_dep:
+                        date_combinations.append((target_dep, ret_date))
+        else:
+            # For one-way: just search different departure dates
+            for dep_offset in range(-flex, flex + 1):
+                dep_date = target_dep + timedelta(days=dep_offset)
+                date_combinations.append((dep_date, None))
+
+        # Remove duplicates
+        date_combinations = list(set(date_combinations))
+        total_searches = len(date_combinations)
+
+        await ctx.report_progress(0.2, f"Searching {total_searches} date combinations...")
+
+        # Search each date combination
+        all_results = []
+        headers = _get_http_headers()
+        headers["Content-Type"] = "application/json"
+
+        async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=DEFAULT_TIMEOUT) as client:
+            for i, (dep_date, ret_date) in enumerate(date_combinations):
+                progress = 0.2 + (0.6 * (i / total_searches))
+                dep_str = dep_date.strftime("%Y-%m-%d")
+                ret_str = ret_date.strftime("%Y-%m-%d") if ret_date else None
+
+                await ctx.report_progress(progress, f"Searching {dep_str}...")
+
+                # Build slices
+                slices = [{"origin": params.origin, "destination": params.destination, "departure_date": dep_str}]
+                if ret_str:
+                    slices.append({"origin": params.destination, "destination": params.origin, "departure_date": ret_str})
+
+                # Build passengers
+                passengers = []
+                for p in params.passengers:
+                    if p.type:
+                        passengers.append({"type": p.type.value})
+                    elif p.age is not None:
+                        passengers.append({"age": p.age})
+                    else:
+                        passengers.append({"type": "adult"})
+
+                request_data = {
+                    "data": {
+                        "slices": slices,
+                        "passengers": passengers,
+                        "cabin_class": params.cabin_class.value if params.cabin_class else "economy"
+                    }
+                }
+
+                if params.max_connections is not None:
+                    request_data["data"]["max_connections"] = params.max_connections
+
+                try:
+                    response = await client.post(
+                        "/air/offer_requests",
+                        headers=headers,
+                        json=request_data,
+                        params={"return_offers": "true"}
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+
+                    offers = data.get("data", {}).get("offers", [])
+                    if offers:
+                        # Get the cheapest offer for this date combo
+                        cheapest = min(offers, key=lambda o: float(o.get("total_amount", "999999")))
+                        all_results.append({
+                            "departure_date": dep_str,
+                            "return_date": ret_str,
+                            "price": float(cheapest.get("total_amount", 0)),
+                            "currency": cheapest.get("total_currency", "USD"),
+                            "offer_id": cheapest.get("id"),
+                            "airline": cheapest.get("owner", {}).get("name", "Unknown"),
+                            "slices": cheapest.get("slices", []),
+                            "is_target_date": (dep_date == target_dep and (ret_date == target_ret or ret_date is None))
+                        })
+                except Exception as e:
+                    logger.warning("Search failed for %s: %s", dep_str, str(e))
+                    continue
+
+        await ctx.report_progress(0.9, "Analyzing results...")
+
+        if not all_results:
+            return "No flights found for any of the searched dates. Try different airports or a wider date range."
+
+        # Sort by price
+        all_results.sort(key=lambda x: x["price"])
+
+        # Find cheapest and target date price
+        cheapest = all_results[0]
+        target_result = next((r for r in all_results if r["is_target_date"]), None)
+
+        # Build response
+        lines = ["# Flexible Date Search Results\n"]
+        lines.append(f"**Route**: {params.origin} → {params.destination}")
+        if is_roundtrip:
+            lines.append(f"**Target Dates**: {params.departure_date} to {params.return_date}")
+        else:
+            lines.append(f"**Target Date**: {params.departure_date}")
+        lines.append(f"**Searched**: +/- {params.flexibility_days} days ({len(all_results)} combinations with results)\n")
+
+        # Cheapest overall
+        lines.append("## 🏆 Cheapest Option Found\n")
+        lines.append(f"**{cheapest['currency']} {cheapest['price']:.2f}** - {cheapest['airline']}")
+        lines.append(f"- Depart: {cheapest['departure_date']}")
+        if cheapest['return_date']:
+            lines.append(f"- Return: {cheapest['return_date']}")
+        lines.append(f"- Offer ID: `{cheapest['offer_id']}`")
+
+        # Add flight details
+        for j, slice_data in enumerate(cheapest.get('slices', [])):
+            segments = slice_data.get('segments', [])
+            if segments:
+                first_seg = segments[0]
+                last_seg = segments[-1]
+                dep_time = first_seg.get('departing_at', '')[:16].replace('T', ' ')
+                arr_time = last_seg.get('arriving_at', '')[:16].replace('T', ' ')
+                stops = len(segments) - 1
+                stop_text = "direct" if stops == 0 else f"{stops} stop(s)"
+                lines.append(f"- Flight {j+1}: {dep_time} → {arr_time} ({stop_text})")
+
+        # Compare to target date
+        if target_result and target_result != cheapest:
+            savings = target_result['price'] - cheapest['price']
+            lines.append(f"\n## 📅 Your Target Dates ({params.departure_date})\n")
+            lines.append(f"**{target_result['currency']} {target_result['price']:.2f}** - {target_result['airline']}")
+            lines.append(f"\n💰 **Savings**: Flying on {cheapest['departure_date']} instead saves **${savings:.2f}**")
+
+        # Top 5 options
+        lines.append("\n## All Options (sorted by price)\n")
+        lines.append("| Dates | Price | Airline | vs Target |")
+        lines.append("|-------|-------|---------|-----------|")
+
+        target_price = target_result['price'] if target_result else cheapest['price']
+        for r in all_results[:10]:
+            dates = r['departure_date']
+            if r['return_date']:
+                dates += f" - {r['return_date']}"
+            diff = r['price'] - target_price
+            diff_str = f"+${diff:.0f}" if diff > 0 else f"-${abs(diff):.0f}" if diff < 0 else "target"
+            marker = " 🏆" if r == cheapest else ""
+            lines.append(f"| {dates} | ${r['price']:.2f}{marker} | {r['airline']} | {diff_str} |")
+
+        # Recommendation
+        lines.append("\n## 💡 Recommendation\n")
+        if cheapest['is_target_date']:
+            lines.append(f"Great news! Your target dates are already the cheapest option at **${cheapest['price']:.2f}**.")
+        elif target_result:
+            savings = target_result['price'] - cheapest['price']
+            if savings > 20:
+                lines.append(f"Consider flying **{cheapest['departure_date']}** instead of {params.departure_date} to save **${savings:.2f}**.")
+            else:
+                lines.append(f"Your target dates are close to the best price. Only ${savings:.2f} difference.")
+        else:
+            lines.append(f"The cheapest option is **${cheapest['price']:.2f}** on {cheapest['departure_date']}.")
+
+        await ctx.report_progress(1.0, "Done")
+        logger.info("Flexible search complete: found %d options, cheapest $%.2f", len(all_results), cheapest['price'])
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error("Flexible search error: %s", str(e))
         return _handle_api_error(e, ctx)
 
 # ============================================================================
