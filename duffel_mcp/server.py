@@ -1174,8 +1174,27 @@ async def search_places_resource(query: str, ctx: Context) -> str:
 def flight_search_instructions() -> str:
     """
     Instructions for the AI travel agent on how to search effectively.
+    Includes current date/time for context.
     """
-    return """# AI Travel Agent Guidelines
+    # Get current date/time for the AI
+    now = datetime.utcnow()
+    current_date = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M UTC")
+    current_year = now.year
+    current_month = now.strftime("%B")
+
+    return f"""# AI Travel Agent Guidelines
+
+## IMPORTANT: Current Date & Time
+
+**Today's Date: {current_date}**
+**Current Time: {current_time}**
+**Current Year: {current_year}**
+
+When users mention months like "February" or "next month", always use {current_year} or later.
+Flight searches must use dates AFTER {current_date}.
+
+Example: If user says "February" and today is November {current_year}, search for February {current_year + 1}.
 
 ## Be a Smart Agent, Not a Questionnaire
 
