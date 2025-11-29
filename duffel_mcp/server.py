@@ -1939,6 +1939,76 @@ async def duffel_create_order(params: CreateOrderInput, ctx: Context) -> str:
     except Exception as e:
         return _handle_api_error(e, ctx)
 
+def _infer_seat_position(designator: str, aisles: int, all_letters_in_cabin: List[str]) -> str:
+    """
+    Infer seat position (window/aisle/middle) from designator and cabin layout.
+
+    Args:
+        designator: Seat designator like "14A" or "7F"
+        aisles: Number of aisles in the cabin (1 or 2)
+        all_letters_in_cabin: Sorted list of all seat letters in this cabin
+
+    Returns:
+        Position string: "Window", "Aisle", "Middle", or "Unknown"
+    """
+    import re
+    match = re.match(r'^(\d+)([A-Z])$', designator.upper())
+    if not match:
+        return "Unknown"
+
+    letter = match.group(2)
+
+    if not all_letters_in_cabin:
+        # Fallback: use common patterns
+        # Single aisle (3-3): A=window, B=middle, C=aisle | D=aisle, E=middle, F=window
+        # Single aisle (2-2): A=window, B=aisle | C=aisle, D=window
+        # Twin aisle (3-3-3): A=window, B=middle, C=aisle | D=middle, E=middle, F=middle | G=aisle, H=middle, J=window
+        if letter in ['A', 'K', 'L']:
+            return "Window"
+        elif letter in ['C', 'D', 'G', 'H'] and aisles >= 1:
+            return "Aisle"
+        elif letter in ['B', 'E', 'F', 'J']:
+            return "Middle" if aisles == 2 or letter == 'B' else "Window" if letter == 'F' else "Middle"
+        return "Unknown"
+
+    # Use actual cabin layout
+    sorted_letters = sorted(all_letters_in_cabin)
+    if letter not in sorted_letters:
+        return "Unknown"
+
+    idx = sorted_letters.index(letter)
+    total = len(sorted_letters)
+
+    if aisles == 1:
+        # Single aisle: typically splits cabin in half
+        # First and last letters are windows
+        # Letters adjacent to middle are aisles
+        if idx == 0 or idx == total - 1:
+            return "Window"
+        mid = total // 2
+        if idx == mid - 1 or idx == mid:
+            return "Aisle"
+        return "Middle"
+    elif aisles == 2:
+        # Twin aisle (wide-body): typically 3-3-3 or 2-4-2 or 3-4-3
+        if idx == 0 or idx == total - 1:
+            return "Window"
+        # Estimate aisle positions (roughly at 1/3 and 2/3)
+        third = total // 3
+        if idx == third or idx == third - 1 or idx == 2 * third or idx == 2 * third + 1:
+            return "Aisle"
+        return "Middle"
+
+    return "Unknown"
+
+
+def _parse_seat_row_number(designator: str) -> int:
+    """Extract row number from seat designator."""
+    import re
+    match = re.match(r'^(\d+)', designator)
+    return int(match.group(1)) if match else 0
+
+
 @mcp.tool(
     name="duffel_get_seat_map",
     annotations={
@@ -1951,18 +2021,24 @@ async def duffel_create_order(params: CreateOrderInput, ctx: Context) -> str:
 )
 async def duffel_get_seat_map(params: GetSeatMapInput, ctx: Context) -> str:
     """
-    Retrieve seat maps for a specific flight offer.
+    Retrieve seat maps for a specific flight offer with layout analysis.
 
     This tool fetches the seat map layout for each flight segment in an offer,
-    showing available seats, their prices, and any restrictions. Use this to
-    help customers choose their preferred seats before booking.
+    showing available seats organized by row. It analyzes the cabin layout to
+    determine seat positions (window/aisle/middle) and helps identify adjacent
+    seats for groups traveling together.
 
     Args:
         params (GetSeatMapInput): Input with offer_id and response_format
         ctx (Context): MCP context for progress reporting
 
     Returns:
-        str: Formatted seat map showing available seats with prices
+        str: Formatted seat map showing:
+        - Cabin layout (number of aisles, seat configuration)
+        - Available seats organized by row
+        - Seat position (window/aisle/middle)
+        - Prices and any restrictions
+        - Adjacent seat suggestions for groups
 
     Note:
         - Not all airlines support seat selection
@@ -1999,77 +2075,181 @@ async def duffel_get_seat_map(params: GetSeatMapInput, ctx: Context) -> str:
 
         for i, seat_map in enumerate(seat_maps, 1):
             segment_id = seat_map.get("segment_id", "N/A")
+            slice_id = seat_map.get("slice_id", "N/A")
             lines.append(f"## Segment {i}")
             lines.append(f"- **Segment ID**: `{segment_id}`")
 
             cabins = seat_map.get("cabins", [])
             for cabin in cabins:
                 cabin_class = cabin.get("cabin_class", "unknown").replace("_", " ").title()
+                aisles = cabin.get("aisles", 1)
+                deck = cabin.get("deck", 0)
+                wings = cabin.get("wings", {})
+
                 lines.append(f"\n### {cabin_class} Class")
 
-                # Count available seats and price range
-                available_seats = []
-                rows = cabin.get("rows", [])
+                # Describe aircraft layout
+                aisle_desc = "single-aisle" if aisles == 1 else "twin-aisle (wide-body)"
+                lines.append(f"- **Layout**: {aisle_desc} aircraft")
+                if deck == 1:
+                    lines.append(f"- **Deck**: Upper deck")
 
-                for row in rows:
+                # Collect all seat data with full context
+                rows_data = cabin.get("rows", [])
+                all_seats = []  # All seats in cabin (available or not)
+                available_seats = []  # Only available seats
+                all_letters = set()  # Track all seat letters for position inference
+
+                for row_idx, row in enumerate(rows_data):
                     sections = row.get("sections", [])
-                    for section in sections:
+                    section_count = len(sections)
+
+                    for section_idx, section in enumerate(sections):
                         elements = section.get("elements", [])
                         for element in elements:
                             if element.get("type") == "seat":
                                 designator = element.get("designator", "?")
+                                # Extract letter for layout analysis
+                                import re
+                                letter_match = re.search(r'([A-Z])$', designator.upper())
+                                if letter_match:
+                                    all_letters.add(letter_match.group(1))
+
+                                seat_name = element.get("name", "")
+                                disclosures = element.get("disclosures", [])
                                 services = element.get("available_services", [])
+
+                                seat_info = {
+                                    "designator": designator,
+                                    "row_num": _parse_seat_row_number(designator),
+                                    "section_idx": section_idx,
+                                    "section_count": section_count,
+                                    "name": seat_name,
+                                    "disclosures": disclosures,
+                                    "available": len(services) > 0,
+                                    "services": services
+                                }
+                                all_seats.append(seat_info)
+
                                 if services:
-                                    # Seat is available
                                     for service in services:
-                                        price = service.get("total_amount", "0")
-                                        currency = service.get("total_currency", "USD")
-                                        service_id = service.get("id", "")
-                                        passenger_id = service.get("passenger_id", "")
                                         available_seats.append({
-                                            "designator": designator,
-                                            "price": float(price),
-                                            "currency": currency,
-                                            "service_id": service_id,
-                                            "passenger_id": passenger_id,
-                                            "disclosures": element.get("disclosures", [])
+                                            **seat_info,
+                                            "price": float(service.get("total_amount", "0")),
+                                            "currency": service.get("total_currency", "USD"),
+                                            "service_id": service.get("id", ""),
+                                            "passenger_id": service.get("passenger_id", "")
                                         })
 
-                if available_seats:
-                    # Group by price
-                    prices = sorted(set(s["price"] for s in available_seats))
-                    currency = available_seats[0]["currency"]
+                # Infer positions for all available seats
+                sorted_letters = sorted(all_letters)
+                for seat in available_seats:
+                    seat["position"] = _infer_seat_position(seat["designator"], aisles, sorted_letters)
 
-                    lines.append(f"- **Available Seats**: {len(available_seats)}")
-
-                    if len(prices) == 1:
-                        lines.append(f"- **Price**: {currency} {prices[0]:.2f}")
-                    else:
-                        lines.append(f"- **Price Range**: {currency} {min(prices):.2f} - {currency} {max(prices):.2f}")
-
-                    # Show seats organized by row
-                    lines.append("\n#### Available Seats")
-                    lines.append("| Seat | Price | Notes |")
-                    lines.append("|------|-------|-------|")
-
-                    # Limit to first 20 to avoid overwhelming output
-                    for seat in sorted(available_seats, key=lambda x: x["designator"])[:20]:
-                        notes = ", ".join(seat.get("disclosures", [])) or "-"
-                        if len(notes) > 30:
-                            notes = notes[:27] + "..."
-                        lines.append(f"| {seat['designator']} | {seat['currency']} {seat['price']:.2f} | {notes} |")
-
-                    if len(available_seats) > 20:
-                        lines.append(f"\n*Showing 20 of {len(available_seats)} available seats. Use JSON format for complete data.*")
-                else:
+                if not available_seats:
                     lines.append("- **Available Seats**: 0 (all seats taken or not available)")
+                    continue
+
+                # Summary stats
+                prices = sorted(set(s["price"] for s in available_seats))
+                currency = available_seats[0]["currency"]
+                window_seats = [s for s in available_seats if s["position"] == "Window"]
+                aisle_seats = [s for s in available_seats if s["position"] == "Aisle"]
+                middle_seats = [s for s in available_seats if s["position"] == "Middle"]
+
+                lines.append(f"- **Available Seats**: {len(available_seats)} total")
+                lines.append(f"  - Window: {len(window_seats)}, Aisle: {len(aisle_seats)}, Middle: {len(middle_seats)}")
+
+                if len(prices) == 1:
+                    lines.append(f"- **Price**: {currency} {prices[0]:.2f}")
+                else:
+                    lines.append(f"- **Price Range**: {currency} {min(prices):.2f} - {currency} {max(prices):.2f}")
+
+                # Group seats by row for layout visualization
+                rows_with_seats = {}
+                for seat in available_seats:
+                    row_num = seat["row_num"]
+                    if row_num not in rows_with_seats:
+                        rows_with_seats[row_num] = []
+                    rows_with_seats[row_num].append(seat)
+
+                # Find adjacent seat pairs/groups (seats in same row)
+                adjacent_groups = []
+                for row_num, row_seats in sorted(rows_with_seats.items()):
+                    if len(row_seats) >= 2:
+                        # Sort by letter to find truly adjacent seats
+                        sorted_row = sorted(row_seats, key=lambda x: x["designator"])
+                        # Check if letters are consecutive (adjacent)
+                        for j in range(len(sorted_row) - 1):
+                            s1, s2 = sorted_row[j], sorted_row[j + 1]
+                            letter1 = s1["designator"][-1]
+                            letter2 = s2["designator"][-1]
+                            # Check if same section (no aisle between)
+                            if s1["section_idx"] == s2["section_idx"]:
+                                # Check if letters are adjacent
+                                if ord(letter2) - ord(letter1) == 1:
+                                    adjacent_groups.append((s1, s2))
+
+                # Show seat layout by row
+                lines.append("\n#### Seats by Row")
+                lines.append("| Row | Seats (Position) | Prices | Notes |")
+                lines.append("|-----|------------------|--------|-------|")
+
+                shown_rows = 0
+                for row_num in sorted(rows_with_seats.keys()):
+                    if shown_rows >= 15:  # Limit rows shown
+                        remaining = len(rows_with_seats) - shown_rows
+                        lines.append(f"| ... | *{remaining} more rows available* | | |")
+                        break
+
+                    row_seats = sorted(rows_with_seats[row_num], key=lambda x: x["designator"])
+                    seats_str = ", ".join([f"{s['designator']} ({s['position'][0]})" for s in row_seats])
+                    prices_str = ", ".join([f"${s['price']:.0f}" for s in row_seats])
+
+                    # Collect notes
+                    notes = set()
+                    for s in row_seats:
+                        if s["name"]:
+                            notes.add(s["name"])
+                        notes.update(s["disclosures"][:1])  # Just first disclosure
+                    notes_str = ", ".join(list(notes)[:2]) if notes else "-"
+                    if len(notes_str) > 25:
+                        notes_str = notes_str[:22] + "..."
+
+                    lines.append(f"| {row_num} | {seats_str} | {prices_str} | {notes_str} |")
+                    shown_rows += 1
+
+                # Suggest adjacent seats for groups
+                if adjacent_groups:
+                    lines.append("\n#### 👥 Adjacent Seat Pairs (for groups)")
+                    lines.append("These seats are next to each other with no aisle between:\n")
+
+                    shown_pairs = 0
+                    for s1, s2 in sorted(adjacent_groups, key=lambda x: x[0]["price"] + x[1]["price"])[:5]:
+                        total_price = s1["price"] + s2["price"]
+                        lines.append(f"- **{s1['designator']} + {s2['designator']}**: {currency} {total_price:.2f} total ({s1['position']} + {s2['position']})")
+                        lines.append(f"  - Service IDs: `{s1['service_id']}`, `{s2['service_id']}`")
+                        shown_pairs += 1
+
+                    if len(adjacent_groups) > 5:
+                        lines.append(f"\n*{len(adjacent_groups) - 5} more adjacent pairs available*")
+                else:
+                    lines.append("\n*No adjacent seat pairs currently available*")
+
+                # Position legend
+                lines.append("\n**Position Key**: W=Window, A=Aisle, M=Middle")
 
             lines.append("")
 
         lines.append("\n## How to Select Seats")
-        lines.append("When booking with `duffel_create_order`, include the seat service ID in the `services` parameter:")
+        lines.append("When booking with `duffel_create_order`, include the seat service ID(s) in the `services` parameter:")
         lines.append("```json")
-        lines.append('{"services": [{"id": "ase_xxx", "quantity": 1}]}')
+        lines.append('{')
+        lines.append('  "services": [')
+        lines.append('    {"id": "ase_xxx_passenger1", "quantity": 1},')
+        lines.append('    {"id": "ase_xxx_passenger2", "quantity": 1}')
+        lines.append('  ]')
+        lines.append('}')
         lines.append("```")
 
         await ctx.report_progress(1.0, "Done")
