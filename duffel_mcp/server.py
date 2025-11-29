@@ -198,6 +198,25 @@ class OptimizationWeights(BaseModel):
         description="Weight for departure time preference (0-1). Higher = time preference matters more."
     )
 
+class TimeRange(BaseModel):
+    """Time range for departure/arrival filtering."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    from_time: str = Field(
+        ...,
+        alias="from",
+        description="Earliest acceptable time in HH:MM format (e.g., '09:00')",
+        pattern=r'^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$'
+    )
+    to_time: str = Field(
+        ...,
+        alias="to",
+        description="Latest acceptable time in HH:MM format (e.g., '17:00')",
+        pattern=r'^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$'
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
 class FlightSlice(BaseModel):
     """A flight slice representing one leg of a journey."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
@@ -218,6 +237,14 @@ class FlightSlice(BaseModel):
         ...,
         description="Departure date in YYYY-MM-DD format (e.g., '2025-11-21')",
         pattern=r'^\d{4}-\d{2}-\d{2}$'
+    )
+    departure_time: Optional[TimeRange] = Field(
+        default=None,
+        description="Filter for departure time window (e.g., {'from': '09:00', 'to': '17:00'})"
+    )
+    arrival_time: Optional[TimeRange] = Field(
+        default=None,
+        description="Filter for arrival time window (e.g., {'from': '12:00', 'to': '20:00'})"
     )
 
 class PassengerInput(BaseModel):
@@ -379,6 +406,20 @@ class AnalyzeOffersInput(BaseModel):
         description="Output format: 'markdown' or 'json'"
     )
 
+class GetSeatMapInput(BaseModel):
+    """Input model for retrieving seat maps."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    offer_id: str = Field(
+        ...,
+        description="The offer ID to get seat maps for",
+        min_length=10
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' or 'json'"
+    )
+
 class OrderPassenger(BaseModel):
     """Passenger details for creating an order."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
@@ -408,6 +449,20 @@ class Payment(BaseModel):
     amount: str = Field(..., description="Payment amount (e.g., '100.00')")
     currency: str = Field(..., description="Currency code (e.g., 'USD', 'GBP')", min_length=3, max_length=3)
 
+class ServiceSelection(BaseModel):
+    """A service to add to the booking (e.g., seat selection, extra baggage)."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    id: str = Field(
+        ...,
+        description="Service ID from seat map or available services (e.g., 'ase_00009htYpSCXrwaB9')"
+    )
+    quantity: int = Field(
+        default=1,
+        description="Quantity of service (usually 1 for seats)",
+        ge=1
+    )
+
 class CreateOrderInput(BaseModel):
     """Input model for creating an order/booking."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
@@ -429,6 +484,10 @@ class CreateOrderInput(BaseModel):
         description="Payment information (required for instant orders)",
         min_length=1,
         max_length=1
+    )
+    services: Optional[List[ServiceSelection]] = Field(
+        default=None,
+        description="Optional services to add (seats, bags). Get IDs from duffel_get_seat_map"
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -714,6 +773,54 @@ def _extract_baggage_info(offer: Dict[str, Any]) -> str:
         return "⚠️ Carry-on only (checked bags extra)"
     else:
         return "⚠️ Baggage info not available"
+
+def _extract_fare_conditions(offer: Dict[str, Any]) -> Dict[str, str]:
+    """Extract fare conditions (change/refund policies) from offer.
+
+    Returns dict with 'change' and 'refund' policy strings.
+    """
+    conditions = offer.get("conditions", {})
+    result = {"change": "Unknown", "refund": "Unknown"}
+
+    # Change policy
+    change = conditions.get("change_before_departure")
+    if change:
+        if change.get("allowed"):
+            penalty = change.get("penalty_amount")
+            currency = change.get("penalty_currency", "")
+            if penalty and float(penalty) > 0:
+                result["change"] = f"✅ Changes allowed ({currency} {penalty} fee)"
+            else:
+                result["change"] = "✅ Free changes"
+        else:
+            result["change"] = "❌ No changes allowed"
+
+    # Refund policy
+    refund = conditions.get("refund_before_departure")
+    if refund:
+        if refund.get("allowed"):
+            penalty = refund.get("penalty_amount")
+            currency = refund.get("penalty_currency", "")
+            if penalty and float(penalty) > 0:
+                result["refund"] = f"✅ Refundable ({currency} {penalty} fee)"
+            else:
+                result["refund"] = "✅ Fully refundable"
+        else:
+            result["refund"] = "❌ Non-refundable"
+
+    return result
+
+def _format_fare_conditions_brief(offer: Dict[str, Any]) -> str:
+    """Format fare conditions as a brief one-liner."""
+    conditions = _extract_fare_conditions(offer)
+    parts = []
+    if "✅" in conditions["refund"]:
+        parts.append("Refundable")
+    else:
+        parts.append("Non-refundable")
+    if "✅" in conditions["change"]:
+        parts.append("Changeable")
+    return " | ".join(parts) if parts else "Conditions unknown"
 
 def _count_stops(offer: Dict[str, Any]) -> int:
     """Count total stops across all slices."""
@@ -1207,7 +1314,10 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
 
     Args:
         params (SearchFlightsInput): Validated input parameters containing:
-            - slices (List[FlightSlice]): Flight segments (1 for one-way, 2 for round-trip)
+            - slices (List[FlightSlice]): Flight segments with optional time filters:
+                - origin, destination, departure_date (required)
+                - departure_time: TimeRange {'from': 'HH:MM', 'to': 'HH:MM'} (optional)
+                - arrival_time: TimeRange {'from': 'HH:MM', 'to': 'HH:MM'} (optional)
             - passengers (List[PassengerInput]): Passenger list (max 9)
             - cabin_class (Optional[CabinClass]): Cabin preference (default: economy)
             - max_connections (Optional[int]): Max connections (0=non-stop)
@@ -1225,7 +1335,8 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
     Examples:
         - "Find flights from SGN to KUL departing Dec 24, returning Dec 26"
         - "Search cheapest business class flights NYC to LON" (search multiple dates!)
-        - "Find best flights considering price, time, and stops"
+        - "Find morning flights departing after 9am" (use departure_time filter)
+        - "Find flights arriving before 8pm" (use arrival_time filter)
     """
     try:
         await ctx.report_progress(0.1, "Validating search parameters...")
@@ -1241,16 +1352,29 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
         )
 
         # Build request payload
+        slices_data = []
+        for slice_data in params.slices:
+            slice_obj = {
+                "origin": slice_data.origin.upper(),
+                "destination": slice_data.destination.upper(),
+                "departure_date": slice_data.departure_date
+            }
+            # Add time filters if specified
+            if slice_data.departure_time:
+                slice_obj["departure_time"] = {
+                    "from": slice_data.departure_time.from_time,
+                    "to": slice_data.departure_time.to_time
+                }
+            if slice_data.arrival_time:
+                slice_obj["arrival_time"] = {
+                    "from": slice_data.arrival_time.from_time,
+                    "to": slice_data.arrival_time.to_time
+                }
+            slices_data.append(slice_obj)
+
         request_data = {
             "data": {
-                "slices": [
-                    {
-                        "origin": slice_data.origin.upper(),
-                        "destination": slice_data.destination.upper(),
-                        "departure_date": slice_data.departure_date
-                    }
-                    for slice_data in params.slices
-                ],
+                "slices": slices_data,
                 "passengers": [
                     {"type": p.type.value} if p.type else {"age": p.age}
                     for p in params.passengers
@@ -1331,6 +1455,7 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
                 lines.append(f"- **Duration**: {_parse_duration_minutes(offer)} minutes")
                 lines.append(f"- **Stops**: {_count_stops(offer)}")
                 lines.append(f"- **Baggage**: {_extract_baggage_info(offer)}")
+                lines.append(f"- **Fare**: {_format_fare_conditions_brief(offer)}")
 
                 for j, slice_data in enumerate(offer.get("slices", []), 1):
                     segments = slice_data.get("segments", [])
@@ -1545,6 +1670,12 @@ async def duffel_get_offer(params: GetOfferInput, ctx: Context) -> str:
         lines.append(f"- **Total Price**: **{_format_price(data.get('total_amount', '0'), data.get('total_currency', 'USD'))}**")
         lines.append(f"- **Airline**: {data.get('owner', {}).get('name', 'N/A')}")
         lines.append(f"- **Baggage**: {_extract_baggage_info(data)}")
+
+        # Fare conditions (refund/change policies)
+        fare_conditions = _extract_fare_conditions(data)
+        lines.append(f"- **Refund Policy**: {fare_conditions['refund']}")
+        lines.append(f"- **Change Policy**: {fare_conditions['change']}")
+
         lines.append(f"- **Expires**: {_format_datetime(data.get('expires_at', 'N/A'))}")
         lines.append(f"- **Live Mode**: {'Yes' if data.get('live_mode') else 'No'}")
 
@@ -1686,8 +1817,15 @@ async def duffel_create_order(params: CreateOrderInput, ctx: Context) -> str:
     complete passenger information (names, DOB, contact details) and payment information.
     This operation charges the payment method and confirms the booking with the airline.
 
+    Optionally, you can add services like seat selection. Get seat service IDs from
+    duffel_get_seat_map and include them in the services parameter.
+
     Args:
-        params (CreateOrderInput): Validated input parameters
+        params (CreateOrderInput): Validated input parameters containing:
+            - selected_offers: List with one offer ID
+            - passengers: Complete passenger details
+            - payments: Payment information
+            - services (optional): Seat selections or other services from duffel_get_seat_map
         ctx (Context): MCP context for progress reporting
 
     Returns:
@@ -1728,6 +1866,13 @@ async def duffel_create_order(params: CreateOrderInput, ctx: Context) -> str:
                 ]
             }
         }
+
+        # Add services (seat selection, extra baggage, etc.) if specified
+        if params.services:
+            request_data["data"]["services"] = [
+                {"id": s.id, "quantity": s.quantity}
+                for s in params.services
+            ]
 
         await ctx.report_progress(0.3, "Creating booking...")
 
@@ -1787,6 +1932,149 @@ async def duffel_create_order(params: CreateOrderInput, ctx: Context) -> str:
             data.get('total_currency', 'USD'),
             data.get('total_amount', '0')
         )
+
+        result = "\n".join(lines)
+        return _truncate_if_needed(result)
+
+    except Exception as e:
+        return _handle_api_error(e, ctx)
+
+@mcp.tool(
+    name="duffel_get_seat_map",
+    annotations={
+        "title": "Get Seat Map",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def duffel_get_seat_map(params: GetSeatMapInput, ctx: Context) -> str:
+    """
+    Retrieve seat maps for a specific flight offer.
+
+    This tool fetches the seat map layout for each flight segment in an offer,
+    showing available seats, their prices, and any restrictions. Use this to
+    help customers choose their preferred seats before booking.
+
+    Args:
+        params (GetSeatMapInput): Input with offer_id and response_format
+        ctx (Context): MCP context for progress reporting
+
+    Returns:
+        str: Formatted seat map showing available seats with prices
+
+    Note:
+        - Not all airlines support seat selection
+        - Seats must be selected during booking (duffel_create_order)
+        - Use the seat service ID when creating an order to select a seat
+    """
+    try:
+        logger.info("Fetching seat map for offer %s", params.offer_id)
+        await ctx.report_progress(0.2, "Fetching seat maps...")
+
+        response = await _make_api_request(
+            ctx,
+            "air/seat_maps",
+            method="GET",
+            params={"offer_id": params.offer_id}
+        )
+
+        await ctx.report_progress(0.7, "Processing seat map data...")
+
+        if params.response_format == ResponseFormat.JSON:
+            result = json.dumps(response, indent=2)
+            return _truncate_if_needed(result)
+
+        # Markdown format
+        seat_maps = response.get("data", [])
+        lines = ["# Seat Maps\n"]
+
+        if not seat_maps:
+            lines.append("**No seat maps available for this offer.**")
+            lines.append("\nThis airline may not support seat selection through the API.")
+            return "\n".join(lines)
+
+        lines.append(f"Found seat maps for {len(seat_maps)} flight segment(s)\n")
+
+        for i, seat_map in enumerate(seat_maps, 1):
+            segment_id = seat_map.get("segment_id", "N/A")
+            lines.append(f"## Segment {i}")
+            lines.append(f"- **Segment ID**: `{segment_id}`")
+
+            cabins = seat_map.get("cabins", [])
+            for cabin in cabins:
+                cabin_class = cabin.get("cabin_class", "unknown").replace("_", " ").title()
+                lines.append(f"\n### {cabin_class} Class")
+
+                # Count available seats and price range
+                available_seats = []
+                rows = cabin.get("rows", [])
+
+                for row in rows:
+                    sections = row.get("sections", [])
+                    for section in sections:
+                        elements = section.get("elements", [])
+                        for element in elements:
+                            if element.get("type") == "seat":
+                                designator = element.get("designator", "?")
+                                services = element.get("available_services", [])
+                                if services:
+                                    # Seat is available
+                                    for service in services:
+                                        price = service.get("total_amount", "0")
+                                        currency = service.get("total_currency", "USD")
+                                        service_id = service.get("id", "")
+                                        passenger_id = service.get("passenger_id", "")
+                                        available_seats.append({
+                                            "designator": designator,
+                                            "price": float(price),
+                                            "currency": currency,
+                                            "service_id": service_id,
+                                            "passenger_id": passenger_id,
+                                            "disclosures": element.get("disclosures", [])
+                                        })
+
+                if available_seats:
+                    # Group by price
+                    prices = sorted(set(s["price"] for s in available_seats))
+                    currency = available_seats[0]["currency"]
+
+                    lines.append(f"- **Available Seats**: {len(available_seats)}")
+
+                    if len(prices) == 1:
+                        lines.append(f"- **Price**: {currency} {prices[0]:.2f}")
+                    else:
+                        lines.append(f"- **Price Range**: {currency} {min(prices):.2f} - {currency} {max(prices):.2f}")
+
+                    # Show seats organized by row
+                    lines.append("\n#### Available Seats")
+                    lines.append("| Seat | Price | Notes |")
+                    lines.append("|------|-------|-------|")
+
+                    # Limit to first 20 to avoid overwhelming output
+                    for seat in sorted(available_seats, key=lambda x: x["designator"])[:20]:
+                        notes = ", ".join(seat.get("disclosures", [])) or "-"
+                        if len(notes) > 30:
+                            notes = notes[:27] + "..."
+                        lines.append(f"| {seat['designator']} | {seat['currency']} {seat['price']:.2f} | {notes} |")
+
+                    if len(available_seats) > 20:
+                        lines.append(f"\n*Showing 20 of {len(available_seats)} available seats. Use JSON format for complete data.*")
+                else:
+                    lines.append("- **Available Seats**: 0 (all seats taken or not available)")
+
+            lines.append("")
+
+        lines.append("\n## How to Select Seats")
+        lines.append("When booking with `duffel_create_order`, include the seat service ID in the `services` parameter:")
+        lines.append("```json")
+        lines.append('{"services": [{"id": "ase_xxx", "quantity": 1}]}')
+        lines.append("```")
+
+        await ctx.report_progress(1.0, "Done")
+
+        logger.info("Retrieved seat maps for offer %s: %d segments", params.offer_id, len(seat_maps))
 
         result = "\n".join(lines)
         return _truncate_if_needed(result)
@@ -1995,6 +2283,7 @@ async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) 
                             "airline": cheapest_offer.get("owner", {}).get("name", "Unknown"),
                             "slices": cheapest_offer.get("slices", []),
                             "baggage": _extract_baggage_info(cheapest_offer),
+                            "fare_conditions": _format_fare_conditions_brief(cheapest_offer),
                             "is_target_date": (dep_date == target_dep and (ret_date == target_ret or ret_date is None))
                         })
                 except Exception as e:
@@ -2029,6 +2318,7 @@ async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) 
         if cheapest['return_date']:
             lines.append(f"- Return: {cheapest['return_date']}")
         lines.append(f"- {cheapest.get('baggage', 'Baggage info not available')}")
+        lines.append(f"- {cheapest.get('fare_conditions', 'Conditions unknown')}")
         lines.append(f"- Offer ID: `{cheapest['offer_id']}`")
 
         # Add flight details
