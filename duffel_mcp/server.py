@@ -22,13 +22,21 @@ import sys
 import json
 import re
 import logging
+import uuid
 from typing import Optional, List, Dict, Any, TypedDict, Tuple, Union
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import httpx
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from fastmcp import FastMCP, Context
+
+# Starlette for checkout HTTP routes
+from starlette.applications import Starlette
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+import uvicorn
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(
@@ -490,6 +498,75 @@ class FlexibleDateSearchInput(BaseModel):
         ge=0,
         le=2
     )
+
+
+# ============================================================================
+# Checkout Flow Models and Session Storage
+# ============================================================================
+
+class CheckoutPassenger(BaseModel):
+    """Passenger details for checkout."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    id: str = Field(..., description="Passenger ID from the offer")
+    given_name: str = Field(..., description="First/given name (as on ID)", min_length=1)
+    family_name: str = Field(..., description="Last/family name (as on ID)", min_length=1)
+    born_on: str = Field(
+        ...,
+        description="Date of birth in YYYY-MM-DD format",
+        pattern=r'^\d{4}-\d{2}-\d{2}$'
+    )
+    email: str = Field(..., description="Email address", pattern=r'^[\w\.-]+@[\w\.-]+\.\w+$')
+    phone_number: str = Field(..., description="Phone number with country code (e.g., '+14155552671')")
+    title: str = Field(..., description="Title: 'mr', 'ms', 'mrs', 'miss', 'dr'")
+    gender: str = Field(..., description="Gender: 'm' or 'f'", pattern=r'^[mf]$')
+
+
+class CreateCheckoutInput(BaseModel):
+    """Input model for creating a checkout session."""
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+
+    offer_id: str = Field(
+        ...,
+        description="The offer ID to book (e.g., 'off_00009htYpSCXrwaB9DnUm0')",
+        min_length=10
+    )
+    passengers: List[CheckoutPassenger] = Field(
+        ...,
+        description="Complete passenger details for all travelers",
+        min_length=1,
+        max_length=9
+    )
+
+
+class CheckoutSession(BaseModel):
+    """Stored checkout session data."""
+    session_id: str
+    offer_id: str
+    offer_data: Dict[str, Any]  # Cached offer details
+    passengers: List[CheckoutPassenger]
+    payment_intent_id: str
+    client_token: str
+    amount: str
+    currency: str
+    created_at: datetime
+    expires_at: datetime
+    status: str = "pending"  # pending, paid, confirmed, failed, expired
+    order_id: Optional[str] = None
+    booking_reference: Optional[str] = None
+
+
+# In-memory session storage (use Redis in production for persistence)
+checkout_sessions: Dict[str, CheckoutSession] = {}
+
+# Duffel Payments fee (approximately 2.9% for cards)
+DUFFEL_PAYMENTS_FEE_PERCENT = 0.029
+
+# Checkout session TTL (matches typical offer expiry)
+CHECKOUT_SESSION_TTL_MINUTES = 30
+
+# Base URL for checkout links (set via environment or auto-detect)
+CHECKOUT_BASE_URL = os.getenv("CHECKOUT_BASE_URL", "")
 
 # ============================================================================
 # Shared Utility Functions
@@ -2010,9 +2087,951 @@ async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) 
         logger.error("Flexible search error: %s", str(e))
         return _handle_api_error(e, ctx)
 
+
+# ============================================================================
+# Checkout Flow - Payment Intent Helpers
+# ============================================================================
+
+async def _create_payment_intent(amount: str, currency: str) -> Dict[str, Any]:
+    """Create a Duffel Payment Intent."""
+    headers = _get_http_headers()
+    headers["Content-Type"] = "application/json"
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        response = await client.post(
+            f"{API_BASE_URL}/payments/payment_intents",
+            headers=headers,
+            json={"data": {"amount": amount, "currency": currency}}
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+
+async def _confirm_payment_intent(payment_intent_id: str) -> Dict[str, Any]:
+    """Confirm a Payment Intent after successful card collection."""
+    headers = _get_http_headers()
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        response = await client.post(
+            f"{API_BASE_URL}/payments/payment_intents/{payment_intent_id}/actions/confirm",
+            headers=headers
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+
+async def _get_offer_details(offer_id: str) -> Dict[str, Any]:
+    """Fetch offer details from Duffel API."""
+    headers = _get_http_headers()
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        response = await client.get(
+            f"{API_BASE_URL}/air/offers/{offer_id}",
+            headers=headers
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+
+async def _create_order_with_balance(
+    offer_id: str,
+    passengers: List[CheckoutPassenger],
+    amount: str,
+    currency: str
+) -> Dict[str, Any]:
+    """Create an order using balance payment (after payment intent confirmation)."""
+    headers = _get_http_headers()
+    headers["Content-Type"] = "application/json"
+
+    order_data = {
+        "data": {
+            "selected_offers": [offer_id],
+            "payments": [{
+                "type": "balance",
+                "amount": amount,
+                "currency": currency
+            }],
+            "passengers": [
+                {
+                    "id": p.id,
+                    "given_name": p.given_name,
+                    "family_name": p.family_name,
+                    "born_on": p.born_on,
+                    "email": p.email,
+                    "phone_number": p.phone_number,
+                    "title": p.title,
+                    "gender": p.gender
+                }
+                for p in passengers
+            ]
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        response = await client.post(
+            f"{API_BASE_URL}/air/orders",
+            headers=headers,
+            json=order_data
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+
+def _calculate_payment_amount(offer_amount: float, currency: str) -> str:
+    """Calculate amount to charge including Duffel Payments fee."""
+    # Amount = offer_total / (1 - fee_percent)
+    # This ensures after Duffel takes their fee, we have enough to cover the offer
+    charge_amount = offer_amount / (1 - DUFFEL_PAYMENTS_FEE_PERCENT)
+    # Round up to 2 decimal places
+    return f"{charge_amount:.2f}"
+
+
+def _get_session(session_id: str) -> Optional[CheckoutSession]:
+    """Get a checkout session, checking for expiry."""
+    session = checkout_sessions.get(session_id)
+    if session and session.expires_at < datetime.utcnow():
+        session.status = "expired"
+        del checkout_sessions[session_id]
+        return None
+    return session
+
+
+# ============================================================================
+# Checkout Flow - HTML Templates
+# ============================================================================
+
+CHECKOUT_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Complete Your Booking</title>
+    <script src="https://assets.duffel.com/components/3.5.0/duffel-payments.js"></script>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        .header {{
+            background: #1a1a2e;
+            color: white;
+            padding: 24px;
+            text-align: center;
+        }}
+        .header h1 {{ font-size: 24px; margin-bottom: 8px; }}
+        .header p {{ opacity: 0.8; font-size: 14px; }}
+        .flight-summary {{
+            padding: 24px;
+            border-bottom: 1px solid #eee;
+        }}
+        .flight-card {{
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }}
+        .flight-route {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }}
+        .airport {{ text-align: center; }}
+        .airport-code {{ font-size: 28px; font-weight: bold; color: #1a1a2e; }}
+        .airport-city {{ font-size: 12px; color: #666; }}
+        .flight-arrow {{
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 16px;
+        }}
+        .flight-arrow::before {{
+            content: '';
+            flex: 1;
+            height: 2px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+        }}
+        .flight-arrow::after {{
+            content: '✈';
+            font-size: 20px;
+            margin-left: -10px;
+        }}
+        .flight-details {{ font-size: 13px; color: #666; }}
+        .flight-details span {{ margin-right: 16px; }}
+        .price-section {{
+            padding: 24px;
+            background: #f8f9fa;
+            text-align: center;
+        }}
+        .price-label {{ font-size: 14px; color: #666; margin-bottom: 4px; }}
+        .price {{ font-size: 36px; font-weight: bold; color: #1a1a2e; }}
+        .price-currency {{ font-size: 18px; }}
+        .passengers {{
+            padding: 24px;
+            border-bottom: 1px solid #eee;
+        }}
+        .passengers h3 {{ margin-bottom: 12px; color: #1a1a2e; }}
+        .passenger {{
+            display: flex;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }}
+        .passenger:last-child {{ border-bottom: none; }}
+        .passenger-icon {{
+            width: 32px; height: 32px;
+            background: #667eea;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            margin-right: 12px;
+            font-size: 14px;
+        }}
+        .payment-section {{
+            padding: 24px;
+        }}
+        .payment-section h3 {{ margin-bottom: 16px; color: #1a1a2e; }}
+        duffel-payments {{
+            display: block;
+            margin-bottom: 16px;
+        }}
+        .error-message {{
+            background: #fee;
+            color: #c00;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            display: none;
+        }}
+        .loading {{
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }}
+        .spinner {{
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f0f0f0;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+        .secure-badge {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 16px;
+            background: #f8f9fa;
+            font-size: 12px;
+            color: #666;
+        }}
+        .secure-badge svg {{ margin-right: 8px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>✈️ Complete Your Booking</h1>
+            <p>Secure payment powered by Duffel</p>
+        </div>
+
+        <div class="flight-summary">
+            {flight_cards}
+        </div>
+
+        <div class="price-section">
+            <div class="price-label">Total Amount</div>
+            <div class="price">
+                <span class="price-currency">{currency}</span> {amount}
+            </div>
+        </div>
+
+        <div class="passengers">
+            <h3>👥 Passengers</h3>
+            {passengers_html}
+        </div>
+
+        <div class="payment-section">
+            <h3>💳 Payment Details</h3>
+            <div id="error-message" class="error-message"></div>
+            <duffel-payments id="duffel-payments"></duffel-payments>
+        </div>
+
+        <div class="secure-badge">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/>
+            </svg>
+            Your payment is secure and encrypted
+        </div>
+    </div>
+
+    <script>
+        const sessionId = "{session_id}";
+        const clientToken = "{client_token}";
+
+        // Initialize the Duffel Payments component
+        const paymentsElement = document.getElementById("duffel-payments");
+        paymentsElement.render({{
+            paymentIntentClientToken: clientToken,
+            debug: {debug_mode}
+        }});
+
+        // Handle successful payment
+        paymentsElement.addEventListener("onSuccessfulPayment", async () => {{
+            document.querySelector('.payment-section').innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <p>Processing your booking...</p>
+                </div>
+            `;
+
+            try {{
+                const response = await fetch(`/checkout/${{sessionId}}/confirm`, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }}
+                }});
+
+                const result = await response.json();
+
+                if (result.success) {{
+                    window.location.href = `/checkout/${{sessionId}}/success`;
+                }} else {{
+                    document.getElementById('error-message').textContent = result.error || 'Booking failed. Please contact support.';
+                    document.getElementById('error-message').style.display = 'block';
+                }}
+            }} catch (err) {{
+                document.getElementById('error-message').textContent = 'An error occurred. Please try again.';
+                document.getElementById('error-message').style.display = 'block';
+            }}
+        }});
+
+        // Handle failed payment
+        paymentsElement.addEventListener("onFailedPayment", (event) => {{
+            const errorMessage = event.detail?.message || 'Payment failed. Please try again.';
+            document.getElementById('error-message').textContent = errorMessage;
+            document.getElementById('error-message').style.display = 'block';
+        }});
+    </script>
+</body>
+</html>'''
+
+
+SUCCESS_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Booking Confirmed!</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .container {{
+            max-width: 500px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+            text-align: center;
+        }}
+        .success-header {{
+            background: #1a1a2e;
+            color: white;
+            padding: 40px 24px;
+        }}
+        .check-icon {{
+            width: 80px;
+            height: 80px;
+            background: #38ef7d;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 40px;
+        }}
+        .success-header h1 {{ font-size: 28px; margin-bottom: 8px; }}
+        .booking-ref {{
+            padding: 24px;
+            background: #f8f9fa;
+        }}
+        .booking-ref-label {{ font-size: 14px; color: #666; margin-bottom: 8px; }}
+        .booking-ref-code {{
+            font-size: 32px;
+            font-weight: bold;
+            color: #1a1a2e;
+            letter-spacing: 4px;
+            font-family: monospace;
+        }}
+        .details {{
+            padding: 24px;
+        }}
+        .detail-item {{
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }}
+        .detail-item:last-child {{ border-bottom: none; }}
+        .detail-label {{ color: #666; }}
+        .detail-value {{ font-weight: 600; color: #1a1a2e; }}
+        .flight-info {{
+            background: #f8f9fa;
+            padding: 24px;
+            margin: 0 24px 24px;
+            border-radius: 12px;
+        }}
+        .flight-route {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #1a1a2e;
+            margin-bottom: 8px;
+        }}
+        .flight-date {{ color: #666; }}
+        .email-notice {{
+            padding: 16px 24px;
+            background: #e8f5e9;
+            color: #2e7d32;
+            font-size: 14px;
+        }}
+        .footer {{
+            padding: 24px;
+            color: #666;
+            font-size: 13px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-header">
+            <div class="check-icon">✓</div>
+            <h1>Booking Confirmed!</h1>
+            <p>Your flight has been booked successfully</p>
+        </div>
+
+        <div class="booking-ref">
+            <div class="booking-ref-label">Booking Reference</div>
+            <div class="booking-ref-code">{booking_reference}</div>
+        </div>
+
+        <div class="flight-info">
+            <div class="flight-route">{route}</div>
+            <div class="flight-date">{dates}</div>
+        </div>
+
+        <div class="details">
+            <div class="detail-item">
+                <span class="detail-label">Order ID</span>
+                <span class="detail-value">{order_id}</span>
+            </div>
+            <div class="detail-item">
+                <span class="detail-label">Total Paid</span>
+                <span class="detail-value">{currency} {amount}</span>
+            </div>
+            <div class="detail-item">
+                <span class="detail-label">Passengers</span>
+                <span class="detail-value">{passenger_count}</span>
+            </div>
+        </div>
+
+        <div class="email-notice">
+            📧 A confirmation email has been sent to your registered email address.
+        </div>
+
+        <div class="footer">
+            <p>Please save your booking reference for check-in.</p>
+            <p>You may receive additional emails directly from the airline.</p>
+        </div>
+    </div>
+</body>
+</html>'''
+
+
+ERROR_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Checkout Error</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .container {{
+            max-width: 400px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            text-align: center;
+        }}
+        .error-icon {{
+            width: 80px;
+            height: 80px;
+            background: #ff416c;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 40px;
+            color: white;
+        }}
+        h1 {{ color: #1a1a2e; margin-bottom: 16px; }}
+        p {{ color: #666; line-height: 1.6; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="error-icon">✕</div>
+        <h1>{title}</h1>
+        <p>{message}</p>
+    </div>
+</body>
+</html>'''
+
+
+# ============================================================================
+# Checkout Flow - HTTP Route Handlers
+# ============================================================================
+
+def _build_flight_cards_html(offer_data: Dict[str, Any]) -> str:
+    """Build HTML for flight cards from offer data."""
+    cards = []
+    for i, slice_data in enumerate(offer_data.get("slices", [])):
+        segments = slice_data.get("segments", [])
+        if not segments:
+            continue
+
+        first_seg = segments[0]
+        last_seg = segments[-1]
+
+        origin = first_seg.get("origin", {})
+        destination = last_seg.get("destination", {})
+
+        origin_code = origin.get("iata_code", "???")
+        origin_city = origin.get("city_name", origin.get("name", ""))
+        dest_code = destination.get("iata_code", "???")
+        dest_city = destination.get("city_name", destination.get("name", ""))
+
+        dep_time = first_seg.get("departing_at", "")[:16].replace("T", " ")
+        arr_time = last_seg.get("arriving_at", "")[:16].replace("T", " ")
+
+        stops = len(segments) - 1
+        stops_text = "Direct" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
+
+        duration = slice_data.get("duration", "")
+
+        airline = first_seg.get("marketing_carrier", {}).get("name", "")
+        flight_num = first_seg.get("marketing_carrier_flight_number", "")
+
+        card = f'''
+        <div class="flight-card">
+            <div class="flight-route">
+                <div class="airport">
+                    <div class="airport-code">{origin_code}</div>
+                    <div class="airport-city">{origin_city}</div>
+                </div>
+                <div class="flight-arrow"></div>
+                <div class="airport">
+                    <div class="airport-code">{dest_code}</div>
+                    <div class="airport-city">{dest_city}</div>
+                </div>
+            </div>
+            <div class="flight-details">
+                <span>🛫 {dep_time}</span>
+                <span>🛬 {arr_time}</span>
+                <span>⏱️ {duration}</span>
+                <span>🔄 {stops_text}</span>
+            </div>
+            <div class="flight-details" style="margin-top: 8px;">
+                <span>✈️ {airline} {flight_num}</span>
+            </div>
+        </div>
+        '''
+        cards.append(card)
+
+    return "\n".join(cards)
+
+
+def _build_passengers_html(passengers: List[CheckoutPassenger]) -> str:
+    """Build HTML for passengers list."""
+    items = []
+    for p in passengers:
+        items.append(f'''
+        <div class="passenger">
+            <div class="passenger-icon">{p.given_name[0].upper()}</div>
+            <span>{p.title.title()}. {p.given_name} {p.family_name}</span>
+        </div>
+        ''')
+    return "\n".join(items)
+
+
+async def checkout_page(request: Request) -> HTMLResponse:
+    """Render the checkout page with Duffel payment component."""
+    session_id = request.path_params.get("session_id")
+    session = _get_session(session_id)
+
+    if not session:
+        return HTMLResponse(
+            ERROR_HTML_TEMPLATE.format(
+                title="Session Expired",
+                message="This checkout session has expired or is invalid. Please start a new booking."
+            ),
+            status_code=404
+        )
+
+    if session.status == "confirmed":
+        return RedirectResponse(url=f"/checkout/{session_id}/success")
+
+    if session.status not in ("pending", "paid"):
+        return HTMLResponse(
+            ERROR_HTML_TEMPLATE.format(
+                title="Checkout Unavailable",
+                message=f"This checkout session is {session.status}. Please start a new booking."
+            ),
+            status_code=400
+        )
+
+    # Build the checkout page
+    flight_cards = _build_flight_cards_html(session.offer_data)
+    passengers_html = _build_passengers_html(session.passengers)
+
+    # Check if we're in debug/test mode
+    debug_mode = "true" if not session.offer_data.get("live_mode", True) else "false"
+
+    html = CHECKOUT_HTML_TEMPLATE.format(
+        session_id=session_id,
+        client_token=session.client_token,
+        flight_cards=flight_cards,
+        passengers_html=passengers_html,
+        currency=session.currency,
+        amount=session.amount,
+        debug_mode=debug_mode
+    )
+
+    return HTMLResponse(html)
+
+
+async def confirm_checkout(request: Request) -> JSONResponse:
+    """Confirm payment and create the booking."""
+    session_id = request.path_params.get("session_id")
+    session = _get_session(session_id)
+
+    if not session:
+        return JSONResponse({"success": False, "error": "Session expired"}, status_code=404)
+
+    if session.status == "confirmed":
+        return JSONResponse({
+            "success": True,
+            "order_id": session.order_id,
+            "booking_reference": session.booking_reference
+        })
+
+    if session.status != "pending":
+        return JSONResponse({"success": False, "error": f"Invalid session status: {session.status}"}, status_code=400)
+
+    try:
+        # 1. Confirm the payment intent
+        logger.info("Confirming payment intent: %s", session.payment_intent_id)
+        payment_result = await _confirm_payment_intent(session.payment_intent_id)
+
+        if payment_result.get("status") != "succeeded":
+            session.status = "failed"
+            return JSONResponse({"success": False, "error": "Payment confirmation failed"}, status_code=400)
+
+        session.status = "paid"
+        logger.info("Payment confirmed, creating order for offer: %s", session.offer_id)
+
+        # 2. Create the order using balance payment
+        # The payment intent tops up our balance, so we pay with balance
+        order_result = await _create_order_with_balance(
+            session.offer_id,
+            session.passengers,
+            session.offer_data.get("total_amount", session.amount),
+            session.offer_data.get("total_currency", session.currency)
+        )
+
+        session.status = "confirmed"
+        session.order_id = order_result.get("id")
+        session.booking_reference = order_result.get("booking_reference")
+
+        logger.info(
+            "Order created: ID=%s, Reference=%s",
+            session.order_id,
+            session.booking_reference
+        )
+
+        return JSONResponse({
+            "success": True,
+            "order_id": session.order_id,
+            "booking_reference": session.booking_reference
+        })
+
+    except httpx.HTTPStatusError as e:
+        logger.error("Checkout confirmation failed: %s", e.response.text)
+        session.status = "failed"
+        try:
+            error_data = e.response.json()
+            error_msg = error_data.get("errors", [{}])[0].get("message", "Booking failed")
+        except:
+            error_msg = "Booking failed. Please contact support."
+        return JSONResponse({"success": False, "error": error_msg}, status_code=500)
+    except Exception as e:
+        logger.exception("Checkout confirmation error: %s", str(e))
+        session.status = "failed"
+        return JSONResponse({"success": False, "error": "An unexpected error occurred"}, status_code=500)
+
+
+async def success_page(request: Request) -> HTMLResponse:
+    """Render the success page after booking."""
+    session_id = request.path_params.get("session_id")
+    session = _get_session(session_id)
+
+    if not session:
+        return HTMLResponse(
+            ERROR_HTML_TEMPLATE.format(
+                title="Session Not Found",
+                message="This checkout session could not be found."
+            ),
+            status_code=404
+        )
+
+    if session.status != "confirmed":
+        return RedirectResponse(url=f"/checkout/{session_id}")
+
+    # Build route string
+    slices = session.offer_data.get("slices", [])
+    if slices:
+        first_slice = slices[0]
+        segments = first_slice.get("segments", [])
+        if segments:
+            origin = segments[0].get("origin", {}).get("iata_code", "???")
+            dest = segments[-1].get("destination", {}).get("iata_code", "???")
+            route = f"{origin} → {dest}"
+            if len(slices) > 1:
+                route += f" → {origin}"  # Round trip
+        else:
+            route = "Flight Details"
+    else:
+        route = "Flight Details"
+
+    # Build dates string
+    dates_parts = []
+    for slice_data in slices:
+        segments = slice_data.get("segments", [])
+        if segments:
+            dep_date = segments[0].get("departing_at", "")[:10]
+            if dep_date:
+                dates_parts.append(dep_date)
+    dates = " - ".join(dates_parts) if dates_parts else ""
+
+    html = SUCCESS_HTML_TEMPLATE.format(
+        booking_reference=session.booking_reference or "N/A",
+        order_id=session.order_id or "N/A",
+        route=route,
+        dates=dates,
+        currency=session.currency,
+        amount=session.amount,
+        passenger_count=len(session.passengers)
+    )
+
+    return HTMLResponse(html)
+
+
+# Define checkout routes
+checkout_routes = [
+    Route("/checkout/{session_id}", checkout_page, methods=["GET"]),
+    Route("/checkout/{session_id}/confirm", confirm_checkout, methods=["POST"]),
+    Route("/checkout/{session_id}/success", success_page, methods=["GET"]),
+]
+
+
+# ============================================================================
+# Checkout Flow - MCP Tool
+# ============================================================================
+
+@mcp.tool(
+    name="duffel_create_checkout",
+    annotations={
+        "title": "Create Checkout Session",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def duffel_create_checkout(params: CreateCheckoutInput, ctx: Context) -> str:
+    """
+    Create a checkout session with a payment link for completing a flight booking.
+
+    This tool creates a secure checkout page where the customer can enter their
+    payment details. After successful payment, the booking is automatically confirmed.
+
+    Use this instead of duffel_create_order when you want the customer to pay
+    via credit/debit card through a secure web form.
+
+    Args:
+        params (CreateCheckoutInput): Contains:
+            - offer_id: The flight offer to book
+            - passengers: Complete passenger details (name, DOB, contact info)
+
+    Returns:
+        A checkout URL that the customer can visit to complete payment.
+        The URL is valid for 30 minutes.
+
+    Example:
+        After finding a flight offer, create a checkout:
+        - offer_id: "off_00009htYpSCXrwaB9DnUm0"
+        - passengers: [{id, given_name, family_name, born_on, email, phone_number, title, gender}]
+    """
+    try:
+        await ctx.report_progress(0.1, "Fetching offer details...")
+
+        # 1. Fetch the current offer to get pricing and validate it's still available
+        offer_data = await _get_offer_details(params.offer_id)
+
+        offer_amount = float(offer_data.get("total_amount", 0))
+        offer_currency = offer_data.get("total_currency", "USD")
+
+        if offer_amount <= 0:
+            return "Error: Invalid offer amount. The offer may have expired."
+
+        # Validate passenger count matches offer
+        offer_passengers = offer_data.get("passengers", [])
+        if len(params.passengers) != len(offer_passengers):
+            return f"Error: Passenger count mismatch. Offer has {len(offer_passengers)} passenger(s), but {len(params.passengers)} provided."
+
+        await ctx.report_progress(0.3, "Creating payment intent...")
+
+        # 2. Calculate payment amount (including Duffel fee buffer)
+        payment_amount = _calculate_payment_amount(offer_amount, offer_currency)
+
+        # 3. Create the payment intent
+        payment_intent = await _create_payment_intent(payment_amount, offer_currency)
+
+        await ctx.report_progress(0.6, "Creating checkout session...")
+
+        # 4. Create and store the checkout session
+        session_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        session = CheckoutSession(
+            session_id=session_id,
+            offer_id=params.offer_id,
+            offer_data=offer_data,
+            passengers=params.passengers,
+            payment_intent_id=payment_intent["id"],
+            client_token=payment_intent["client_token"],
+            amount=payment_amount,
+            currency=offer_currency,
+            created_at=now,
+            expires_at=now + timedelta(minutes=CHECKOUT_SESSION_TTL_MINUTES),
+            status="pending"
+        )
+
+        checkout_sessions[session_id] = session
+
+        await ctx.report_progress(0.9, "Generating checkout URL...")
+
+        # 5. Generate the checkout URL
+        if CHECKOUT_BASE_URL:
+            checkout_url = f"{CHECKOUT_BASE_URL}/checkout/{session_id}"
+        else:
+            # For local development, provide instructions
+            checkout_url = f"/checkout/{session_id}"
+
+        logger.info(
+            "Checkout session created: %s for offer %s, amount %s %s",
+            session_id, params.offer_id, offer_currency, payment_amount
+        )
+
+        await ctx.report_progress(1.0, "Checkout ready")
+
+        # Format response
+        lines = ["# Checkout Session Created\n"]
+        lines.append("## Flight Summary")
+        lines.append(f"- **Price**: {offer_currency} {offer_amount:.2f}")
+        lines.append(f"- **Payment Amount**: {offer_currency} {payment_amount} (includes processing fee)")
+        lines.append(f"- **Passengers**: {len(params.passengers)}")
+
+        # Add flight details
+        for i, slice_data in enumerate(offer_data.get("slices", []), 1):
+            segments = slice_data.get("segments", [])
+            if segments:
+                first_seg = segments[0]
+                last_seg = segments[-1]
+                origin = first_seg.get("origin", {}).get("iata_code", "?")
+                dest = last_seg.get("destination", {}).get("iata_code", "?")
+                dep_time = first_seg.get("departing_at", "")[:16].replace("T", " ")
+                lines.append(f"- **Flight {i}**: {origin} → {dest} on {dep_time}")
+
+        lines.append(f"\n## 💳 Payment Link")
+        lines.append(f"\n**[Click here to complete payment]({checkout_url})**")
+        lines.append(f"\n`{checkout_url}`")
+        lines.append(f"\n⏰ This link expires in {CHECKOUT_SESSION_TTL_MINUTES} minutes.")
+        lines.append("\n---")
+        lines.append("The customer should open this link to enter their payment details securely.")
+        lines.append("Once payment is complete, the booking will be confirmed automatically.")
+
+        return "\n".join(lines)
+
+    except httpx.HTTPStatusError as e:
+        logger.error("Failed to create checkout: %s", e.response.text)
+        try:
+            error_data = e.response.json()
+            error_msg = error_data.get("errors", [{}])[0].get("message", str(e))
+        except:
+            error_msg = str(e)
+        return f"Error creating checkout: {error_msg}"
+    except Exception as e:
+        logger.exception("Checkout creation error: %s", str(e))
+        return f"Error: {str(e)}"
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
+
+def create_combined_app(mcp_app):
+    """Create a Starlette app that combines MCP SSE routes with checkout routes."""
+    # The checkout routes are served at /checkout/*
+    # The MCP SSE routes are served at /sse and /messages (mounted at root)
+    routes = checkout_routes + [
+        Mount("/", app=mcp_app),
+    ]
+    return Starlette(routes=routes)
+
 
 def main():
     """Run the Duffel MCP server with configurable transport."""
@@ -2058,11 +3077,19 @@ def main():
         mcp.run()
     elif args.transport == "sse":
         # HTTP with Server-Sent Events for web deployments
-        logger.info("SSE server starting on http://%s:%d", args.host, args.port)
-        mcp.run(
-            transport="sse",
+        # Combined with checkout routes for payment flow
+        logger.info("SSE server with checkout starting on http://%s:%d", args.host, args.port)
+        logger.info("Checkout pages available at http://%s:%d/checkout/{session_id}", args.host, args.port)
+
+        # Get the MCP SSE app and combine with checkout routes
+        mcp_sse_app = mcp.sse_app()
+        combined_app = create_combined_app(mcp_sse_app)
+
+        uvicorn.run(
+            combined_app,
             host=args.host,
-            port=args.port
+            port=args.port,
+            log_level="info" if not args.debug else "debug"
         )
 
 
