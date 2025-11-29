@@ -1677,7 +1677,6 @@ def main():
         logger.info("SSE server starting on http://%s:%d", args.host, args.port)
         mcp.run(
             transport="sse",
-            sse_path="/sse",
             host=args.host,
             port=args.port
         )
