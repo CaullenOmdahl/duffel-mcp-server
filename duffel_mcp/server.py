@@ -603,14 +603,14 @@ class CheckoutSession(BaseModel):
     session_id: str
     offer_id: str
     offer_data: Dict[str, Any]  # Cached offer details
-    passengers: List[CheckoutPassenger]
+    passengers: Optional[List[CheckoutPassenger]] = None  # Collected on checkout page
     payment_intent_id: str
     client_token: str
     amount: str
     currency: str
     created_at: datetime
     expires_at: datetime
-    status: str = "pending"  # pending, paid, confirmed, failed, expired
+    status: str = "pending"  # pending, passengers_collected, paid, confirmed, failed, expired
     order_id: Optional[str] = None
     booking_reference: Optional[str] = None
 
@@ -1240,6 +1240,7 @@ For each option, include relevant warnings inline:
 | "Flights on specific date" | `duffel_search_flights` |
 | "Compare airlines" | `duffel_search_flights` with optimization |
 | "Details on an offer" | `duffel_get_offer` |
+| "Book this flight" / "Let's book" | `duffel_get_checkout_url` (just needs offer ID!) |
 
 ## Key Tool: duffel_flexible_search
 
@@ -1249,6 +1250,21 @@ It automatically searches +/- N days and compares prices, saving you from doing 
 Example: User says "cheapest flight to KL for Christmas"
 → Use `duffel_flexible_search` with departure_date="2025-12-24", return_date="2025-12-26", flexibility_days=3
 → Tool searches Dec 21-27 range and returns comparison with recommendations
+
+## Booking Flow - IMPORTANT
+
+When the user wants to book:
+1. Use `duffel_get_checkout_url` with just the offer_id
+2. Give them the checkout URL
+3. They enter passenger details and payment ON THE CHECKOUT PAGE
+4. DO NOT ask for their name, DOB, email, phone in chat - the checkout page handles this!
+
+**Good response:**
+"Here's your booking link: https://flights.example.com/checkout/abc123
+Click to enter your details and complete payment. The link is valid for 30 minutes."
+
+**Bad response (DON'T DO THIS):**
+"To book, I'll need your full name, date of birth, email, and phone number..."
 
 ## Optimization Strategies (for duffel_search_flights)
 
@@ -1305,12 +1321,10 @@ Show top options with inline notes:
 - Everything else → search and advise
 
 ### 5. Book When Ready
-Collect passenger details only after they choose:
-- Name (as on passport)
-- Date of birth
-- Contact info (email, phone)
+When they pick a flight, use `duffel_get_checkout_url` with just the offer ID.
+The checkout page will collect their passenger details and payment - no need to ask in chat!
 
-Use `duffel_get_offer` to verify price, then `duffel_create_order` to book.
+Just say: "Here's your booking link: [URL]. You'll enter your details and payment on the secure checkout page."
 """
 
 @mcp.prompt("find_cheapest")
@@ -3217,6 +3231,300 @@ ERROR_HTML_TEMPLATE = '''<!DOCTYPE html>
 </html>'''
 
 
+PASSENGER_FORM_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enter Passenger Details</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        .header {{
+            background: #1a1a2e;
+            color: white;
+            padding: 24px;
+            text-align: center;
+        }}
+        .header h1 {{ font-size: 24px; margin-bottom: 8px; }}
+        .header p {{ opacity: 0.8; font-size: 14px; }}
+        .steps {{
+            display: flex;
+            justify-content: center;
+            padding: 16px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #eee;
+        }}
+        .step {{
+            display: flex;
+            align-items: center;
+            color: #999;
+            font-size: 14px;
+        }}
+        .step.active {{ color: #667eea; font-weight: 600; }}
+        .step-number {{
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #ddd;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 8px;
+            font-size: 12px;
+        }}
+        .step.active .step-number {{ background: #667eea; color: white; }}
+        .step-divider {{ width: 40px; height: 2px; background: #ddd; margin: 0 16px; }}
+        .flight-summary {{
+            padding: 24px;
+            border-bottom: 1px solid #eee;
+        }}
+        .flight-card {{
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }}
+        .flight-route {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }}
+        .airport {{ text-align: center; }}
+        .airport-code {{ font-size: 28px; font-weight: bold; color: #1a1a2e; }}
+        .airport-city {{ font-size: 12px; color: #666; }}
+        .flight-arrow {{
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0 16px;
+        }}
+        .flight-arrow::before {{
+            content: '';
+            flex: 1;
+            height: 2px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+        }}
+        .flight-arrow::after {{
+            content: '✈';
+            font-size: 20px;
+            margin-left: -10px;
+        }}
+        .flight-details {{ font-size: 13px; color: #666; }}
+        .flight-details span {{ margin-right: 16px; }}
+        .price-badge {{
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            margin-top: 12px;
+        }}
+        .form-section {{
+            padding: 24px;
+        }}
+        .form-section h3 {{
+            margin-bottom: 20px;
+            color: #1a1a2e;
+            display: flex;
+            align-items: center;
+        }}
+        .passenger-form {{
+            border: 1px solid #eee;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }}
+        .passenger-form h4 {{
+            font-size: 14px;
+            color: #667eea;
+            margin-bottom: 16px;
+        }}
+        .form-row {{
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }}
+        .form-group {{
+            flex: 1;
+        }}
+        .form-group label {{
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: #666;
+            margin-bottom: 4px;
+        }}
+        .form-group input, .form-group select {{
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }}
+        .form-group input:focus, .form-group select:focus {{
+            outline: none;
+            border-color: #667eea;
+        }}
+        .form-group.small {{ flex: 0 0 100px; }}
+        .submit-btn {{
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        .submit-btn:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }}
+        .submit-btn:disabled {{
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }}
+        .error-message {{
+            background: #fee;
+            color: #c00;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            display: none;
+        }}
+        .required {{ color: #c00; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>✈️ Complete Your Booking</h1>
+            <p>Step 1 of 2 - Enter passenger details</p>
+        </div>
+
+        <div class="steps">
+            <div class="step active">
+                <div class="step-number">1</div>
+                <span>Passengers</span>
+            </div>
+            <div class="step-divider"></div>
+            <div class="step">
+                <div class="step-number">2</div>
+                <span>Payment</span>
+            </div>
+        </div>
+
+        <div class="flight-summary">
+            {flight_cards}
+            <div class="price-badge">{currency} {amount}</div>
+        </div>
+
+        <form id="passenger-form" class="form-section">
+            <h3>👥 Passenger Information</h3>
+            <div id="error-message" class="error-message"></div>
+
+            {passenger_forms}
+
+            <button type="submit" class="submit-btn">Continue to Payment →</button>
+        </form>
+    </div>
+
+    <script>
+        const sessionId = "{session_id}";
+        const passengerIds = {passenger_ids_json};
+
+        document.getElementById('passenger-form').addEventListener('submit', async (e) => {{
+            e.preventDefault();
+
+            const btn = e.target.querySelector('.submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Processing...';
+
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.style.display = 'none';
+
+            // Collect passenger data
+            const passengers = passengerIds.map((id, index) => ({{
+                id: id,
+                given_name: document.getElementById(`given_name_${{index}}`).value.trim(),
+                family_name: document.getElementById(`family_name_${{index}}`).value.trim(),
+                born_on: document.getElementById(`born_on_${{index}}`).value,
+                email: document.getElementById(`email_${{index}}`).value.trim(),
+                phone_number: document.getElementById(`phone_${{index}}`).value.trim(),
+                title: document.getElementById(`title_${{index}}`).value,
+                gender: document.getElementById(`gender_${{index}}`).value
+            }}));
+
+            // Validate
+            for (let i = 0; i < passengers.length; i++) {{
+                const p = passengers[i];
+                if (!p.given_name || !p.family_name || !p.born_on || !p.email || !p.phone_number) {{
+                    errorDiv.textContent = `Please fill in all fields for Passenger ${{i + 1}}`;
+                    errorDiv.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Continue to Payment →';
+                    return;
+                }}
+                // Basic email validation
+                if (!p.email.includes('@')) {{
+                    errorDiv.textContent = `Invalid email address for Passenger ${{i + 1}}`;
+                    errorDiv.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Continue to Payment →';
+                    return;
+                }}
+            }}
+
+            try {{
+                const response = await fetch(`/checkout/${{sessionId}}/passengers`, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ passengers }})
+                }});
+
+                const result = await response.json();
+
+                if (result.success) {{
+                    window.location.reload();
+                }} else {{
+                    errorDiv.textContent = result.error || 'Failed to save passenger details';
+                    errorDiv.style.display = 'block';
+                    btn.disabled = false;
+                    btn.textContent = 'Continue to Payment →';
+                }}
+            }} catch (err) {{
+                errorDiv.textContent = 'An error occurred. Please try again.';
+                errorDiv.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Continue to Payment →';
+            }}
+        }});
+    </script>
+</body>
+</html>'''
+
+
 # ============================================================================
 # Checkout Flow - HTTP Route Handlers
 # ============================================================================
@@ -3293,6 +3601,62 @@ def _build_passengers_html(passengers: List[CheckoutPassenger]) -> str:
     return "\n".join(items)
 
 
+def _build_passenger_forms_html(passenger_ids: List[str]) -> str:
+    """Build HTML for passenger input forms."""
+    forms = []
+    for i, passenger_id in enumerate(passenger_ids):
+        passenger_type = "Adult" if i == 0 else f"Passenger {i + 1}"
+        forms.append(f'''
+        <div class="passenger-form">
+            <h4>✈️ {passenger_type}</h4>
+            <div class="form-row">
+                <div class="form-group small">
+                    <label>Title <span class="required">*</span></label>
+                    <select id="title_{i}" required>
+                        <option value="mr">Mr</option>
+                        <option value="ms">Ms</option>
+                        <option value="mrs">Mrs</option>
+                        <option value="miss">Miss</option>
+                        <option value="dr">Dr</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>First Name <span class="required">*</span></label>
+                    <input type="text" id="given_name_{i}" placeholder="As on ID/passport" required>
+                </div>
+                <div class="form-group">
+                    <label>Last Name <span class="required">*</span></label>
+                    <input type="text" id="family_name_{i}" placeholder="As on ID/passport" required>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Date of Birth <span class="required">*</span></label>
+                    <input type="date" id="born_on_{i}" required>
+                </div>
+                <div class="form-group small">
+                    <label>Gender <span class="required">*</span></label>
+                    <select id="gender_{i}" required>
+                        <option value="m">Male</option>
+                        <option value="f">Female</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Email <span class="required">*</span></label>
+                    <input type="email" id="email_{i}" placeholder="email@example.com" required>
+                </div>
+                <div class="form-group">
+                    <label>Phone <span class="required">*</span></label>
+                    <input type="tel" id="phone_{i}" placeholder="+1234567890" required>
+                </div>
+            </div>
+        </div>
+        ''')
+    return "\n".join(forms)
+
+
 async def checkout_page(request: Request) -> HTMLResponse:
     """Render the checkout page with Duffel payment component."""
     session_id = request.path_params.get("session_id")
@@ -3310,7 +3674,7 @@ async def checkout_page(request: Request) -> HTMLResponse:
     if session.status == "confirmed":
         return RedirectResponse(url=f"/checkout/{session_id}/success")
 
-    if session.status not in ("pending", "paid"):
+    if session.status not in ("pending", "paid", "passengers_collected"):
         return HTMLResponse(
             ERROR_HTML_TEMPLATE.format(
                 title="Checkout Unavailable",
@@ -3319,7 +3683,26 @@ async def checkout_page(request: Request) -> HTMLResponse:
             status_code=400
         )
 
-    # Build the checkout page
+    # Get passenger IDs from offer data
+    offer_passengers = session.offer_data.get("passengers", [])
+    passenger_ids = [p.get("id", f"pas_{i}") for i, p in enumerate(offer_passengers)]
+
+    # If passengers haven't been collected yet, show the passenger form
+    if not session.passengers:
+        flight_cards = _build_flight_cards_html(session.offer_data)
+        passenger_forms = _build_passenger_forms_html(passenger_ids)
+
+        html = PASSENGER_FORM_HTML_TEMPLATE.format(
+            session_id=session_id,
+            flight_cards=flight_cards,
+            passenger_forms=passenger_forms,
+            passenger_ids_json=json.dumps(passenger_ids),
+            currency=session.currency,
+            amount=session.amount
+        )
+        return HTMLResponse(html)
+
+    # Passengers collected - show payment page
     flight_cards = _build_flight_cards_html(session.offer_data)
     passengers_html = _build_passengers_html(session.passengers)
 
@@ -3339,6 +3722,56 @@ async def checkout_page(request: Request) -> HTMLResponse:
     return HTMLResponse(html)
 
 
+async def save_passengers(request: Request) -> JSONResponse:
+    """Save passenger details to the checkout session."""
+    session_id = request.path_params.get("session_id")
+    session = _get_session(session_id)
+
+    if not session:
+        return JSONResponse({"success": False, "error": "Session expired"}, status_code=404)
+
+    if session.passengers:
+        return JSONResponse({"success": True, "message": "Passengers already saved"})
+
+    try:
+        body = await request.json()
+        passengers_data = body.get("passengers", [])
+
+        if not passengers_data:
+            return JSONResponse({"success": False, "error": "No passenger data provided"}, status_code=400)
+
+        # Validate and convert to CheckoutPassenger objects
+        passengers = []
+        for p in passengers_data:
+            try:
+                passenger = CheckoutPassenger(
+                    id=p.get("id", ""),
+                    given_name=p.get("given_name", ""),
+                    family_name=p.get("family_name", ""),
+                    born_on=p.get("born_on", ""),
+                    email=p.get("email", ""),
+                    phone_number=p.get("phone_number", ""),
+                    title=p.get("title", "mr"),
+                    gender=p.get("gender", "m")
+                )
+                passengers.append(passenger)
+            except Exception as e:
+                return JSONResponse({"success": False, "error": f"Invalid passenger data: {str(e)}"}, status_code=400)
+
+        # Update session
+        session.passengers = passengers
+        session.status = "passengers_collected"
+        session_store.update(session)
+
+        logger.info("Passengers saved for session %s: %d passengers", session_id, len(passengers))
+
+        return JSONResponse({"success": True})
+
+    except Exception as e:
+        logger.exception("Error saving passengers: %s", str(e))
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 async def confirm_checkout(request: Request) -> JSONResponse:
     """Confirm payment and create the booking."""
     session_id = request.path_params.get("session_id")
@@ -3354,8 +3787,12 @@ async def confirm_checkout(request: Request) -> JSONResponse:
             "booking_reference": session.booking_reference
         })
 
-    if session.status != "pending":
+    if session.status not in ("pending", "passengers_collected"):
         return JSONResponse({"success": False, "error": f"Invalid session status: {session.status}"}, status_code=400)
+
+    # Check that passengers have been collected
+    if not session.passengers:
+        return JSONResponse({"success": False, "error": "Passengers not yet collected"}, status_code=400)
 
     try:
         # 1. Confirm the payment intent
@@ -3473,6 +3910,7 @@ async def success_page(request: Request) -> HTMLResponse:
 # Define checkout routes
 checkout_routes = [
     Route("/checkout/{session_id}", checkout_page, methods=["GET"]),
+    Route("/checkout/{session_id}/passengers", save_passengers, methods=["POST"]),
     Route("/checkout/{session_id}/confirm", confirm_checkout, methods=["POST"]),
     Route("/checkout/{session_id}/success", success_page, methods=["GET"]),
 ]
@@ -3617,6 +4055,133 @@ async def duffel_create_checkout(params: CreateCheckoutInput, ctx: Context) -> s
         return f"Error creating checkout: {error_msg}"
     except Exception as e:
         logger.exception("Checkout creation error: %s", str(e))
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(
+    name="duffel_get_checkout_url",
+    annotations={
+        "title": "Get Checkout URL",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True
+    }
+)
+async def duffel_get_checkout_url(offer_id: str, ctx: Context) -> str:
+    """
+    Get a checkout URL for a flight offer. The customer enters their details on the checkout page.
+
+    This is the RECOMMENDED way to book flights. Simply provide the offer ID and get back
+    a checkout URL. The customer will enter their passenger details and payment information
+    on a secure checkout page - no need to collect personal info in chat.
+
+    Use this instead of duffel_create_checkout or duffel_create_order for a better UX.
+
+    Args:
+        offer_id: The flight offer ID to book (e.g., 'off_00009htYpSCXrwaB9DnUm0')
+        ctx: MCP context
+
+    Returns:
+        A checkout URL where the customer enters their details and completes payment.
+    """
+    try:
+        await ctx.report_progress(0.1, "Fetching offer details...")
+
+        # 1. Fetch the current offer to get pricing and validate it's still available
+        offer_data = await _get_offer_details(offer_id)
+
+        offer_amount = float(offer_data.get("total_amount", 0))
+        offer_currency = offer_data.get("total_currency", "USD")
+
+        if offer_amount <= 0:
+            return "Error: Invalid offer amount. The offer may have expired."
+
+        # Get passenger count from offer
+        offer_passengers = offer_data.get("passengers", [])
+        passenger_count = len(offer_passengers)
+
+        await ctx.report_progress(0.3, "Creating payment intent...")
+
+        # 2. Calculate payment amount (including Duffel fee buffer)
+        payment_amount = _calculate_payment_amount(offer_amount, offer_currency)
+
+        # 3. Create the payment intent
+        payment_intent = await _create_payment_intent(payment_amount, offer_currency)
+
+        await ctx.report_progress(0.6, "Creating checkout session...")
+
+        # 4. Create and store the checkout session (without passengers - they enter on page)
+        session_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        session = CheckoutSession(
+            session_id=session_id,
+            offer_id=offer_id,
+            offer_data=offer_data,
+            passengers=None,  # Will be collected on checkout page
+            payment_intent_id=payment_intent["id"],
+            client_token=payment_intent["client_token"],
+            amount=payment_amount,
+            currency=offer_currency,
+            created_at=now,
+            expires_at=now + timedelta(minutes=CHECKOUT_SESSION_TTL_MINUTES),
+            status="pending"
+        )
+
+        session_store.save(session)
+
+        await ctx.report_progress(0.9, "Generating checkout URL...")
+
+        # 5. Generate the checkout URL
+        if CHECKOUT_BASE_URL:
+            checkout_url = f"{CHECKOUT_BASE_URL}/checkout/{session_id}"
+        else:
+            checkout_url = f"/checkout/{session_id}"
+
+        logger.info(
+            "Checkout URL created: %s for offer %s, amount %s %s, %d passengers",
+            session_id, offer_id, offer_currency, payment_amount, passenger_count
+        )
+
+        await ctx.report_progress(1.0, "Checkout ready")
+
+        # Build flight summary for the response
+        flight_info = []
+        for i, slice_data in enumerate(offer_data.get("slices", []), 1):
+            segments = slice_data.get("segments", [])
+            if segments:
+                first_seg = segments[0]
+                last_seg = segments[-1]
+                origin = first_seg.get("origin", {}).get("iata_code", "?")
+                dest = last_seg.get("destination", {}).get("iata_code", "?")
+                dep_time = first_seg.get("departing_at", "")[:10]
+                airline = first_seg.get("marketing_carrier", {}).get("name", "")
+                flight_info.append(f"{origin} → {dest} on {dep_time} ({airline})")
+
+        # Format simple response
+        lines = [
+            f"**Book this flight: {checkout_url}**",
+            "",
+            f"Flight: {' | '.join(flight_info)}",
+            f"Price: {offer_currency} {offer_amount:.2f} ({passenger_count} passenger{'s' if passenger_count > 1 else ''})",
+            "",
+            f"The checkout page will collect passenger details and payment.",
+            f"Link expires in {CHECKOUT_SESSION_TTL_MINUTES} minutes."
+        ]
+
+        return "\n".join(lines)
+
+    except httpx.HTTPStatusError as e:
+        logger.error("Failed to create checkout URL: %s", e.response.text)
+        try:
+            error_data = e.response.json()
+            error_msg = error_data.get("errors", [{}])[0].get("message", str(e))
+        except:
+            error_msg = str(e)
+        return f"Error creating checkout: {error_msg}"
+    except Exception as e:
+        logger.exception("Checkout URL creation error: %s", str(e))
         return f"Error: {str(e)}"
 
 
