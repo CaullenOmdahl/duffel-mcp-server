@@ -612,6 +612,32 @@ def _parse_duration_minutes(offer: Dict[str, Any]) -> int:
             total_minutes += hours * 60 + minutes
     return total_minutes
 
+def _extract_baggage_info(offer: Dict[str, Any]) -> str:
+    """Extract baggage allowance info from offer.
+
+    Returns a concise string like "✅ 1x checked bag" or "⚠️ Carry-on only"
+    """
+    checked_bags = 0
+    carry_on = 0
+
+    for slice_data in offer.get("slices", []):
+        for segment in slice_data.get("segments", []):
+            for passenger in segment.get("passengers", []):
+                for baggage in passenger.get("baggages", []):
+                    bag_type = baggage.get("type", "")
+                    quantity = baggage.get("quantity", 0)
+                    if bag_type == "checked":
+                        checked_bags = max(checked_bags, quantity)
+                    elif bag_type == "carry_on":
+                        carry_on = max(carry_on, quantity)
+
+    if checked_bags > 0:
+        return f"✅ {checked_bags}x checked bag included"
+    elif carry_on > 0:
+        return "⚠️ Carry-on only (checked bags extra)"
+    else:
+        return "⚠️ Baggage info not available"
+
 def _count_stops(offer: Dict[str, Any]) -> int:
     """Count total stops across all slices."""
     total_stops = 0
@@ -1227,6 +1253,7 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
                 lines.append(f"- **Owner**: {offer.get('owner', {}).get('name', 'N/A')}")
                 lines.append(f"- **Duration**: {_parse_duration_minutes(offer)} minutes")
                 lines.append(f"- **Stops**: {_count_stops(offer)}")
+                lines.append(f"- **Baggage**: {_extract_baggage_info(offer)}")
 
                 for j, slice_data in enumerate(offer.get("slices", []), 1):
                     segments = slice_data.get("segments", [])
@@ -1440,6 +1467,7 @@ async def duffel_get_offer(params: GetOfferInput, ctx: Context) -> str:
         lines.append(f"- **Offer ID**: `{data.get('id', 'N/A')}`")
         lines.append(f"- **Total Price**: **{_format_price(data.get('total_amount', '0'), data.get('total_currency', 'USD'))}**")
         lines.append(f"- **Airline**: {data.get('owner', {}).get('name', 'N/A')}")
+        lines.append(f"- **Baggage**: {_extract_baggage_info(data)}")
         lines.append(f"- **Expires**: {_format_datetime(data.get('expires_at', 'N/A'))}")
         lines.append(f"- **Live Mode**: {'Yes' if data.get('live_mode') else 'No'}")
 
