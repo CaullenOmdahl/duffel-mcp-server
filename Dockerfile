@@ -6,8 +6,9 @@ WORKDIR /app
 COPY duffel_mcp/pyproject.toml .
 RUN pip install fastmcp httpx pydantic starlette uvicorn redis
 
-# Copy server code
+# Copy server code and static assets
 COPY duffel_mcp/server.py .
+COPY duffel_mcp/static ./static
 
 # Set checkout base URL (Railway injects RAILWAY_PUBLIC_DOMAIN)
 ENV CHECKOUT_BASE_URL=""

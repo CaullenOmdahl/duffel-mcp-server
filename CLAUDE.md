@@ -48,19 +48,31 @@ docker run -p 8080:8080 -e DUFFEL_API_KEY_LIVE=xxx -e CHECKOUT_BASE_URL=http://l
 - `_confirm_payment_intent()`: Confirm payment after card collection
 - `create_combined_app()`: Combine MCP SSE with Starlette checkout routes
 
-### Checkout Flow
+### Booking Flow (Duffel Links)
 
-The `duffel_create_checkout` tool creates a hosted checkout page:
+The `duffel_get_booking_link` tool creates a branded booking page via Duffel Links:
+
+1. **MCP Tool** creates Duffel Links session → returns booking URL
+2. **Booking Page** (hosted by Duffel) handles search, selection, passenger details, and payment
+3. **Redirect** to success/failure URL after completion
+
+This is the recommended approach - no need to collect passenger info in chat!
+
+**Environment variables for Duffel Links:**
+- `DUFFEL_LINKS_LOGO_URL`: URL to your brand logo (e.g., `https://flights.dumawtf.com/logo.svg`)
+- `DUFFEL_LINKS_PRIMARY_COLOR`: Brand color in hex (default: `#354640`)
+- `DUFFEL_LINKS_SUCCESS_URL`: Redirect URL after successful booking
+- `DUFFEL_LINKS_FAILURE_URL`: Redirect URL on failure
+- `DUFFEL_LINKS_ABANDONMENT_URL`: Redirect URL if user abandons checkout
+
+### Legacy Checkout Flow (requires Duffel Payments)
+
+The `duffel_create_checkout` tool creates a self-hosted checkout page (requires Duffel Payments enabled):
 
 1. **MCP Tool** creates payment intent + session → returns checkout URL
 2. **Checkout Page** (`/checkout/{session_id}`) shows flight summary + Duffel card component
 3. **Confirmation** (`/checkout/{session_id}/confirm`) confirms payment + creates order
 4. **Success Page** (`/checkout/{session_id}/success`) shows booking reference
-
-**Key models:**
-- `CheckoutSession`: Stored session with offer, passengers, payment intent
-- `CreateCheckoutInput`: Input for `duffel_create_checkout` tool
-- `SessionStore`: Redis-backed session storage with in-memory fallback
 
 **Environment variables:**
 - `CHECKOUT_BASE_URL`: Full URL for checkout links (e.g., `https://your-app.railway.app`)

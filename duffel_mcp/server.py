@@ -33,9 +33,10 @@ from fastmcp import FastMCP, Context
 
 # Starlette for checkout HTTP routes
 from starlette.applications import Starlette
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from starlette.routing import Route, Mount
 from starlette.requests import Request
+from pathlib import Path
 import uvicorn
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
@@ -626,6 +627,13 @@ CHECKOUT_BASE_URL = os.getenv("CHECKOUT_BASE_URL", "")
 
 # Redis URL for session storage (optional - falls back to in-memory)
 REDIS_URL = os.getenv("REDIS_URL", "")
+
+# Duffel Links configuration
+DUFFEL_LINKS_LOGO_URL = os.getenv("DUFFEL_LINKS_LOGO_URL", "")
+DUFFEL_LINKS_PRIMARY_COLOR = os.getenv("DUFFEL_LINKS_PRIMARY_COLOR", "#354640")  # Black sheep green
+DUFFEL_LINKS_SUCCESS_URL = os.getenv("DUFFEL_LINKS_SUCCESS_URL", "")
+DUFFEL_LINKS_FAILURE_URL = os.getenv("DUFFEL_LINKS_FAILURE_URL", "")
+DUFFEL_LINKS_ABANDONMENT_URL = os.getenv("DUFFEL_LINKS_ABANDONMENT_URL", "")
 
 
 # ============================================================================
@@ -1240,7 +1248,7 @@ For each option, include relevant warnings inline:
 | "Flights on specific date" | `duffel_search_flights` |
 | "Compare airlines" | `duffel_search_flights` with optimization |
 | "Details on an offer" | `duffel_get_offer` |
-| "Book this flight" / "Let's book" | `duffel_get_checkout_url` (just needs offer ID!) |
+| "Book a flight" / "Ready to book" | `duffel_get_booking_link` |
 
 ## Key Tool: duffel_flexible_search
 
@@ -1254,14 +1262,14 @@ Example: User says "cheapest flight to KL for Christmas"
 ## Booking Flow - IMPORTANT
 
 When the user wants to book:
-1. Use `duffel_get_checkout_url` with just the offer_id
-2. Give them the checkout URL
-3. They enter passenger details and payment ON THE CHECKOUT PAGE
-4. DO NOT ask for their name, DOB, email, phone in chat - the checkout page handles this!
+1. Use `duffel_get_booking_link` to get a branded booking page URL
+2. Give them the booking link
+3. They search, select, enter details, and pay ON THE BOOKING PAGE
+4. DO NOT ask for their name, DOB, email, phone in chat - the booking page handles everything!
 
 **Good response:**
-"Here's your booking link: https://flights.example.com/checkout/abc123
-Click to enter your details and complete payment. The link is valid for 30 minutes."
+"Here's your booking link: [URL]
+This opens a professional booking page where you can search flights, enter your details, and pay securely."
 
 **Bad response (DON'T DO THIS):**
 "To book, I'll need your full name, date of birth, email, and phone number..."
@@ -1321,10 +1329,10 @@ Show top options with inline notes:
 - Everything else → search and advise
 
 ### 5. Book When Ready
-When they pick a flight, use `duffel_get_checkout_url` with just the offer ID.
-The checkout page will collect their passenger details and payment - no need to ask in chat!
+When they're ready to book, use `duffel_get_booking_link` to get a branded booking page.
+The booking page handles everything - search, selection, passenger details, and payment.
 
-Just say: "Here's your booking link: [URL]. You'll enter your details and payment on the secure checkout page."
+Just say: "Here's your booking link: [URL]. You can search, compare, and book directly on that page."
 """
 
 @mcp.prompt("find_cheapest")
@@ -2748,6 +2756,66 @@ async def _get_offer_details(offer_id: str) -> Dict[str, Any]:
         return response.json()["data"]
 
 
+async def _create_duffel_links_session(
+    reference: str,
+    markup_amount: Optional[str] = None,
+    markup_rate: Optional[str] = None,
+    currency: str = "USD"
+) -> Dict[str, Any]:
+    """
+    Create a Duffel Links session for hosted flight search and booking.
+
+    Args:
+        reference: Unique reference for this user/session
+        markup_amount: Fixed markup amount (e.g., "5.00")
+        markup_rate: Percentage markup as decimal (e.g., "0.05" for 5%)
+        currency: Currency code (default USD)
+
+    Returns:
+        Duffel Links session data including the booking URL
+    """
+    headers = _get_http_headers()
+    headers["Content-Type"] = "application/json"
+
+    # Build session data
+    session_data: Dict[str, Any] = {
+        "reference": reference,
+        "traveller_currency": currency,
+        "flights": {"enabled": True},
+        "stays": {"enabled": False},
+    }
+
+    # Add branding if configured
+    if DUFFEL_LINKS_LOGO_URL:
+        session_data["logo_url"] = DUFFEL_LINKS_LOGO_URL
+    if DUFFEL_LINKS_PRIMARY_COLOR:
+        session_data["primary_color"] = DUFFEL_LINKS_PRIMARY_COLOR
+
+    # Add redirect URLs if configured
+    if DUFFEL_LINKS_SUCCESS_URL:
+        session_data["success_url"] = DUFFEL_LINKS_SUCCESS_URL
+    if DUFFEL_LINKS_FAILURE_URL:
+        session_data["failure_url"] = DUFFEL_LINKS_FAILURE_URL
+    if DUFFEL_LINKS_ABANDONMENT_URL:
+        session_data["abandonment_url"] = DUFFEL_LINKS_ABANDONMENT_URL
+
+    # Add markup if specified
+    if markup_amount:
+        session_data["markup_amount"] = markup_amount
+        session_data["markup_currency"] = currency
+    if markup_rate:
+        session_data["markup_rate"] = markup_rate
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        response = await client.post(
+            f"{API_BASE_URL}/links/sessions",
+            headers=headers,
+            json={"data": session_data}
+        )
+        response.raise_for_status()
+        return response.json()["data"]
+
+
 async def _create_order_with_balance(
     offer_id: str,
     passengers: List[CheckoutPassenger],
@@ -3907,8 +3975,47 @@ async def success_page(request: Request) -> HTMLResponse:
     return HTMLResponse(html)
 
 
+# Static file serving
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+async def serve_logo(request: Request) -> FileResponse:
+    """Serve the logo file."""
+    logo_path = STATIC_DIR / "logo.svg"
+    if logo_path.exists():
+        return FileResponse(logo_path, media_type="image/svg+xml")
+    return JSONResponse({"error": "Logo not found"}, status_code=404)
+
+
+async def serve_static(request: Request) -> FileResponse:
+    """Serve static files."""
+    filename = request.path_params.get("filename", "")
+    # Security: prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+
+    file_path = STATIC_DIR / filename
+    if file_path.exists() and file_path.is_file():
+        # Determine media type
+        suffix = file_path.suffix.lower()
+        media_types = {
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".ico": "image/x-icon",
+            ".css": "text/css",
+            ".js": "application/javascript",
+        }
+        media_type = media_types.get(suffix, "application/octet-stream")
+        return FileResponse(file_path, media_type=media_type)
+    return JSONResponse({"error": "File not found"}, status_code=404)
+
+
 # Define checkout routes
 checkout_routes = [
+    Route("/logo.svg", serve_logo, methods=["GET"]),
+    Route("/static/{filename:path}", serve_static, methods=["GET"]),
     Route("/checkout/{session_id}", checkout_page, methods=["GET"]),
     Route("/checkout/{session_id}/passengers", save_passengers, methods=["POST"]),
     Route("/checkout/{session_id}/confirm", confirm_checkout, methods=["POST"]),
@@ -4059,129 +4166,93 @@ async def duffel_create_checkout(params: CreateCheckoutInput, ctx: Context) -> s
 
 
 @mcp.tool(
-    name="duffel_get_checkout_url",
+    name="duffel_get_booking_link",
     annotations={
-        "title": "Get Checkout URL",
+        "title": "Get Booking Link",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True
     }
 )
-async def duffel_get_checkout_url(offer_id: str, ctx: Context) -> str:
+async def duffel_get_booking_link(
+    reference: Optional[str] = None,
+    currency: str = "USD",
+    ctx: Context = None
+) -> str:
     """
-    Get a checkout URL for a flight offer. The customer enters their details on the checkout page.
+    Get a branded booking link where customers can search and book flights.
 
-    This is the RECOMMENDED way to book flights. Simply provide the offer ID and get back
-    a checkout URL. The customer will enter their passenger details and payment information
-    on a secure checkout page - no need to collect personal info in chat.
+    This uses Duffel Links - a hosted booking interface. The customer gets a
+    professional booking page where they can:
+    - Search for flights
+    - Select their preferred option
+    - Enter passenger details
+    - Complete payment
 
-    Use this instead of duffel_create_checkout or duffel_create_order for a better UX.
+    No need to collect any personal info in chat!
 
     Args:
-        offer_id: The flight offer ID to book (e.g., 'off_00009htYpSCXrwaB9DnUm0')
+        reference: Optional user/session reference for tracking (auto-generated if not provided)
+        currency: Currency for prices (default: USD)
         ctx: MCP context
 
     Returns:
-        A checkout URL where the customer enters their details and completes payment.
+        A booking URL for the customer to complete their flight booking.
     """
     try:
-        await ctx.report_progress(0.1, "Fetching offer details...")
+        await ctx.report_progress(0.2, "Creating booking session...")
 
-        # 1. Fetch the current offer to get pricing and validate it's still available
-        offer_data = await _get_offer_details(offer_id)
+        # Generate reference if not provided
+        if not reference:
+            reference = f"booking_{uuid.uuid4().hex[:12]}"
 
-        offer_amount = float(offer_data.get("total_amount", 0))
-        offer_currency = offer_data.get("total_currency", "USD")
-
-        if offer_amount <= 0:
-            return "Error: Invalid offer amount. The offer may have expired."
-
-        # Get passenger count from offer
-        offer_passengers = offer_data.get("passengers", [])
-        passenger_count = len(offer_passengers)
-
-        await ctx.report_progress(0.3, "Creating payment intent...")
-
-        # 2. Calculate payment amount (including Duffel fee buffer)
-        payment_amount = _calculate_payment_amount(offer_amount, offer_currency)
-
-        # 3. Create the payment intent
-        payment_intent = await _create_payment_intent(payment_amount, offer_currency)
-
-        await ctx.report_progress(0.6, "Creating checkout session...")
-
-        # 4. Create and store the checkout session (without passengers - they enter on page)
-        session_id = str(uuid.uuid4())
-        now = datetime.utcnow()
-
-        session = CheckoutSession(
-            session_id=session_id,
-            offer_id=offer_id,
-            offer_data=offer_data,
-            passengers=None,  # Will be collected on checkout page
-            payment_intent_id=payment_intent["id"],
-            client_token=payment_intent["client_token"],
-            amount=payment_amount,
-            currency=offer_currency,
-            created_at=now,
-            expires_at=now + timedelta(minutes=CHECKOUT_SESSION_TTL_MINUTES),
-            status="pending"
+        # Create Duffel Links session
+        session_data = await _create_duffel_links_session(
+            reference=reference,
+            currency=currency
         )
 
-        session_store.save(session)
+        await ctx.report_progress(0.8, "Booking link ready...")
 
-        await ctx.report_progress(0.9, "Generating checkout URL...")
+        booking_url = session_data.get("url", "")
+        session_id = session_data.get("id", "")
 
-        # 5. Generate the checkout URL
-        if CHECKOUT_BASE_URL:
-            checkout_url = f"{CHECKOUT_BASE_URL}/checkout/{session_id}"
-        else:
-            checkout_url = f"/checkout/{session_id}"
+        if not booking_url:
+            return "Error: Failed to get booking URL from Duffel Links"
 
         logger.info(
-            "Checkout URL created: %s for offer %s, amount %s %s, %d passengers",
-            session_id, offer_id, offer_currency, payment_amount, passenger_count
+            "Duffel Links session created: %s (ref: %s)",
+            session_id, reference
         )
 
-        await ctx.report_progress(1.0, "Checkout ready")
+        await ctx.report_progress(1.0, "Done")
 
-        # Build flight summary for the response
-        flight_info = []
-        for i, slice_data in enumerate(offer_data.get("slices", []), 1):
-            segments = slice_data.get("segments", [])
-            if segments:
-                first_seg = segments[0]
-                last_seg = segments[-1]
-                origin = first_seg.get("origin", {}).get("iata_code", "?")
-                dest = last_seg.get("destination", {}).get("iata_code", "?")
-                dep_time = first_seg.get("departing_at", "")[:10]
-                airline = first_seg.get("marketing_carrier", {}).get("name", "")
-                flight_info.append(f"{origin} → {dest} on {dep_time} ({airline})")
-
-        # Format simple response
+        # Format response
         lines = [
-            f"**Book this flight: {checkout_url}**",
+            f"**Book your flight: {booking_url}**",
             "",
-            f"Flight: {' | '.join(flight_info)}",
-            f"Price: {offer_currency} {offer_amount:.2f} ({passenger_count} passenger{'s' if passenger_count > 1 else ''})",
+            "This link opens a professional booking page where you can:",
+            "- Search and compare flights",
+            "- Enter passenger details",
+            "- Complete secure payment",
             "",
-            f"The checkout page will collect passenger details and payment.",
-            f"Link expires in {CHECKOUT_SESSION_TTL_MINUTES} minutes."
+            "The link expires in 24 hours.",
+            f"Reference: {reference}"
         ]
 
         return "\n".join(lines)
 
     except httpx.HTTPStatusError as e:
-        logger.error("Failed to create checkout URL: %s", e.response.text)
+        logger.error("Failed to create booking link: %s", e.response.text)
         try:
             error_data = e.response.json()
             error_msg = error_data.get("errors", [{}])[0].get("message", str(e))
         except:
             error_msg = str(e)
-        return f"Error creating checkout: {error_msg}"
+        return f"Error creating booking link: {error_msg}"
     except Exception as e:
-        logger.exception("Checkout URL creation error: %s", str(e))
+        logger.exception("Booking link creation error: %s", str(e))
         return f"Error: {str(e)}"
 
 
