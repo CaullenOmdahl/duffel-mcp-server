@@ -10,7 +10,7 @@ RUN pip install fastmcp httpx pydantic
 COPY duffel_mcp/server.py .
 
 # Expose port for SSE transport
-EXPOSE 8000
+EXPOSE 8080
 
 # Run with SSE transport
-CMD ["python", "server.py", "--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "server.py", "--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]
