@@ -775,77 +775,78 @@ async def search_places_resource(query: str, ctx: Context) -> str:
 @mcp.resource("duffel://instructions")
 def flight_search_instructions() -> str:
     """
-    Instructions for using the Duffel flight search tools effectively.
-
-    READ THIS FIRST before searching for flights to ensure you gather
-    all necessary information from the user.
+    Instructions for the AI travel agent on how to search effectively.
     """
-    return """# Flight Search Assistant Instructions
+    return """# AI Travel Agent Guidelines
 
-## CRITICAL: Always Ask Before Searching
+## Be a Smart Agent, Not a Questionnaire
 
-Before performing ANY flight search, you MUST gather these details from the user:
+You are a helpful travel agent. Don't interrogate the customer with many questions.
+Instead, be proactive: search comprehensively and present findings with smart advice.
 
-### Required Information:
-1. **Departure Airport(s)**: Ask which airport they want to fly from. Offer alternatives if applicable.
-2. **Destination Airport(s)**: Confirm the destination. Some cities have multiple airports.
-3. **Travel Dates**: Get specific dates or date ranges.
-4. **Date Flexibility**: Ask if they can be flexible (+/- 1-3 days) - this often saves significant money.
-5. **Trip Type**: One-way or round-trip? If round-trip, how many nights?
-6. **Number of Passengers**: Adults, children, infants?
+### Only Ask When Truly Needed:
+- **Departure city** - if not clear from context (but infer from their location if known)
+- **Approximate dates** - if not mentioned at all
+- **Trip length** - only if they said round-trip but didn't mention return
 
-### Important Questions to Ask:
-7. **Priority**: What matters most - price, duration, or convenience?
-8. **Direct vs Connections**: Are layovers acceptable to save money?
-9. **Time Preference**: Morning, afternoon, or evening departures?
-10. **Luggage Needs**: Checked bags needed? (Budget airlines charge extra!)
-11. **Cabin Class**: Economy, premium economy, business, or first?
-12. **Airline Preferences**: Any preferred airlines or ones to avoid?
+### DON'T Ask About (Just Handle It):
+- Luggage: Search and NOTE in results if baggage isn't included
+- Connections: Show both options and note "direct" vs "1 stop (2hr layover)"
+- Time of day: Show a range of options
+- Cabin class: Default to economy unless they mention otherwise
+- Airline preferences: Show what's available, note if budget carrier
 
-## Multi-Date Search Strategy
+## Proactive Search Strategy
 
-For finding the cheapest flights, ALWAYS search multiple date combinations:
+When user wants the "cheapest" or "best deal":
+1. **Search multiple dates automatically** (+/- 3 days from target)
+2. **Compare and present** the best options found
+3. **Advise** on trade-offs ("Flying Dec 23 instead of Dec 24 saves $85")
 
-1. Search the user's preferred dates first
-2. If flexible, search +/- 1, 2, 3 days for departure
-3. If round-trip and flexible, search different return dates too
-4. Compare all results and present a summary table
+## Smart Result Presentation
 
-Example: For a flexible Christmas trip, search Dec 22-27 departures with various return dates.
+For each option, include relevant warnings inline:
 
-## Presenting Results
+**Good Example:**
+"✈️ **$301** - Malaysia Airlines (MH751)
+- Dec 24: SGN 11:00 → KUL 14:10 (direct, 2h10m)
+- Dec 26: KUL 17:10 → SGN 18:10 (direct, 2h)
+- ✅ 20kg checked bag included"
 
-Always show:
-- Price (total, including taxes)
-- Airlines
-- Departure and arrival times
-- Number of stops and layover duration
-- Total travel time
-- Any trade-offs between options
+"✈️ **$189** - AirAsia (AK857)
+- Dec 24: SGN 08:30 → KUL 11:45 (direct, 2h15m)
+- Dec 26: KUL 19:00 → SGN 20:05 (direct, 2h5m)
+- ⚠️ Carry-on only - checked bag +$35 each way"
 
-## Hidden Costs to Warn About
+"✈️ **$156** - VietJet + Firefly
+- Dec 24: SGN 06:00 → KUL 15:30 (1 stop, 5h layover in SIN)
+- ⚠️ Long layover, separate tickets, bags not included"
 
-- Budget airlines (Spirit, Frontier, Ryanair, etc.) often charge $30-60+ per checked bag
-- Seat selection may cost extra on basic fares
-- Basic economy fares may not allow changes or refunds
-- Long layovers on cheap connecting flights
+## Key Behaviors
+
+1. **Infer intelligently** - Use context about the user
+2. **Search broadly** - Multiple dates, multiple airlines
+3. **Advise clearly** - Note trade-offs, hidden costs, long layovers
+4. **Be concise** - Present findings, don't ask unnecessary questions
+5. **Recommend** - "I'd suggest the Malaysia Airlines option - only $45 more but includes bags and better times"
+
+## When to Ask vs Infer
+
+| Situation | Action |
+|-----------|--------|
+| User says "cheapest to Paris" | Search +/- 3 days, present options |
+| User says "Christmas in Tokyo" | Infer Dec 24-26ish, ask how many days |
+| User mentions budget | Prioritize price, warn about fees |
+| User mentions "quick trip" | Note total travel times prominently |
+| User is vague about dates | Ask for approximate timeframe |
 
 ## Optimization Strategies
 
-- `cheapest`: Lowest price regardless of convenience
+- `cheapest`: Find lowest price (search multiple dates!)
 - `fastest`: Shortest total travel time
-- `best`: Weighted score balancing price, duration, stops, and times
+- `best`: Balanced score (good for general "find me flights")
 - `least_stops`: Prioritize direct flights
-- `earliest`: Morning departures first
-- `latest`: Evening departures first
-
-## Remember
-
-1. ALWAYS ask clarifying questions first
-2. NEVER assume the user's preferences
-3. Search multiple dates when user is flexible
-4. Warn about hidden fees on budget carriers
-5. Refresh offers before booking - prices change quickly
+- `earliest`/`latest`: Time-of-day preference
 """
 
 # ============================================================================
@@ -861,79 +862,45 @@ def book_round_trip_prompt(
     passengers: str = "1 adult"
 ) -> str:
     """
-    Interactive workflow for booking a round-trip flight.
-
-    This prompt guides through the complete booking process from
-    search to confirmation, starting with clarifying questions.
+    Smart workflow for booking a round-trip flight.
+    Be helpful, not interrogative. Search proactively and advise.
     """
-    return f"""# Round-Trip Flight Booking Assistant
+    return f"""# Round-Trip Flight Booking
 
-Help the user book a round-trip flight. **IMPORTANT: Always start by asking clarifying questions before searching.**
+## Trip: {origin} → {destination}
+- Outbound: {departure_date}
+- Return: {return_date}
+- Passengers: {passengers}
 
-## Step 0: Gather Requirements (REQUIRED)
+## Your Approach
 
-Before ANY search, ask the user these questions to understand their needs:
+### 1. Search Proactively
+- Search the requested dates immediately
+- If looking for best deal, also search +/- 2-3 days and compare
+- Use `optimization: "best"` for balanced results
 
-### Essential Questions:
-1. **Departure Airport**: "Which airport would you like to fly from? (e.g., {origin}, or any nearby alternatives?)"
-2. **Date Flexibility**: "Are your dates fixed, or do you have flexibility? (Searching +/- 3 days often finds better prices)"
-3. **Time Preferences**: "Do you prefer morning, afternoon, or evening flights?"
-4. **Direct vs Connections**: "Do you need direct flights only, or are connections okay if it saves money?"
-
-### Budget & Comfort Questions:
-5. **Priority**: "What's more important: lowest price, shortest travel time, or best overall value?"
-6. **Luggage**: "Will you need checked baggage? (Budget airlines often charge extra)"
-7. **Cabin Class**: "Economy, premium economy, or business class?"
-
-### Trip Details Provided:
-- **Destination**: {destination}
-- **Target Departure**: {departure_date}
-- **Target Return**: {return_date}
-- **Passengers**: {passengers}
-
-## Step 1: Search Strategy
-
-Based on user responses, search appropriately:
-
-- **If dates are flexible**: Search multiple date combinations (+/- 3 days) using `duffel_search_flights` for each combination, then compare
-- **If price is priority**: Use `optimization: "cheapest"`
-- **If time matters**: Use `optimization: "fastest"` or `optimization: "earliest"`/`"latest"`
-- **For best value**: Use `optimization: "best"` (weighted scoring)
-- **For direct flights**: Set `max_connections: 0`
-
-## Step 2: Present Options
-
-Show top 5 options with:
-- Total price (including all fees)
+### 2. Present Options with Advice
+Show top options with inline notes:
+- Price and what's included (bags, changes)
 - Flight times and duration
-- Number of stops
-- Airlines
-- Baggage information if available
+- Direct vs connections (note layover length if long)
+- Budget carrier warnings if applicable
 
-## Step 3: Confirm Selection
+### 3. Make a Recommendation
+"Based on your trip, I'd recommend [option] because..."
 
-Use `duffel_get_offer` to verify:
-- Current pricing (offers expire quickly)
-- Baggage allowances
-- Cancellation policies
+### 4. Only Ask If Truly Needed
+- Missing departure city → ask
+- Vague dates ("sometime in December") → ask for range
+- Everything else → search and advise
 
-## Step 4: Collect Passenger Details
-
-For booking, collect:
-- Full name (as on passport/ID)
+### 5. Book When Ready
+Collect passenger details only after they choose:
+- Name (as on passport)
 - Date of birth
-- Email and phone
-- Title (Mr/Ms/Mrs) and gender
+- Contact info (email, phone)
 
-## Step 5: Create Booking
-
-Use `duffel_create_order` to finalize.
-
-## Key Tips
-- ALWAYS ask clarifying questions first
-- Search multiple dates if user is flexible
-- Refresh offer before booking (prices change)
-- Warn about basic economy baggage restrictions
+Use `duffel_get_offer` to verify price, then `duffel_create_order` to book.
 """
 
 @mcp.prompt("find_cheapest")
@@ -942,88 +909,48 @@ def find_cheapest_prompt(
     trip_type: str = "round-trip"
 ) -> str:
     """
-    Find the cheapest flight with comprehensive questioning and multi-date search.
-
-    This prompt ensures thorough requirements gathering before searching
-    and searches across multiple dates to find the truly cheapest option.
+    Find the cheapest flight - search proactively across multiple dates.
     """
-    return f"""# Find the Cheapest Flight Assistant
+    return f"""# Find Cheapest Flight to {destination}
 
-Help the user find the most affordable flight to {destination}. **CRITICAL: Ask all clarifying questions BEFORE searching.**
+## Your Mission
+Find the absolute best deal. Search proactively, advise on trade-offs.
 
-## Step 0: Required Questions (ASK ALL OF THESE)
+## Search Strategy (Do This Automatically)
 
-### Location Questions:
-1. "Which airport(s) would you like to depart from? Are there nearby alternatives you'd consider?" (e.g., if NYC: JFK, LGA, EWR)
-2. "For {destination}, is there a specific airport, or should I check all options?"
+1. **Search multiple dates** - Don't just search one date. Search +/- 3 days:
+   - If user wants Dec 24-26, also check Dec 22-27 departures/returns
+   - Track the cheapest option found across all searches
 
-### Date Questions:
-3. "What are your ideal travel dates?"
-4. "How flexible are you with dates? Options:"
-   - Fixed dates (must travel these exact days)
-   - Flexible +/- 1-2 days
-   - Very flexible +/- 3-5 days (best for finding deals)
-   - Completely flexible (just need to go sometime in a date range)
+2. **Use `optimization: "cheapest"`** for all searches
 
-### Trip Questions:
-5. "Is this {trip_type}? If round-trip, how many days/nights?"
-6. "What time of day works best? Morning, afternoon, evening, or no preference?"
-7. "Are connections okay if they save significant money, or do you need direct flights?"
+3. **Compare and advise**:
+   - "Cheapest overall: $156 on Dec 22-25"
+   - "Your preferred dates (Dec 24-26): $301"
+   - "Savings: $145 by flying 2 days earlier"
 
-### Requirements Questions:
-8. "Will you need checked baggage? (Budget airlines often charge $30-60+ per bag)"
-9. "Any airline preferences or airlines to avoid?"
-10. "Any other requirements? (extra legroom, specific alliance, etc.)"
+## Present Results With Context
 
-## Step 1: Multi-Date Search Strategy
+For each option, note:
+- ✅ What's good (included bags, direct flight, good times)
+- ⚠️ What to watch out for (no bags, long layover, 5am departure, budget carrier)
 
-**For truly finding the cheapest, search MULTIPLE date combinations:**
+Example:
+"**$156** - VietJet (Dec 22-25)
+⚠️ Basic fare: +$35/bag each way, 6:00am departure
+Actual cost with 1 bag: ~$226"
 
-### If Round-Trip with Flexible Dates (+/- 3 days):
-Search these combinations and track prices:
-- Original dates
-- Depart 1 day earlier, return same
-- Depart 1 day later, return same
-- Depart same, return 1 day earlier
-- Depart same, return 1 day later
-- Depart 2-3 days earlier/later combinations
-- Weekday vs weekend departures
+"**$301** - Malaysia Airlines (Dec 24-26)
+✅ 20kg bag included, reasonable 11am departure
+Better value if you're checking luggage"
 
-Use `duffel_search_flights` with `optimization: "cheapest"` for each search.
+## Only Ask If Needed
+- No departure city mentioned → ask where they're flying from
+- Very vague dates ("sometime next month") → ask for a target week
+- Otherwise → just search and present findings
 
-### Track Results:
-Create a comparison showing:
-| Dates | Price | Airlines | Duration | Stops |
-|-------|-------|----------|----------|-------|
-
-## Step 2: Present Findings
-
-Show the user:
-1. **Cheapest overall** (even if inconvenient)
-2. **Cheapest on their preferred dates**
-3. **Best value** (price vs convenience trade-off)
-4. **Price difference** between options ("Flying Tuesday instead saves $85")
-
-## Step 3: Hidden Costs Warning
-
-Before user decides, warn about:
-- Baggage fees (especially budget carriers like Spirit, Frontier, Ryanair)
-- Seat selection fees
-- No-frills fare restrictions (no changes, no refunds)
-- Long layovers on "cheap" connecting flights
-
-## Budget Tips to Share:
-- Tuesday/Wednesday flights are often cheapest
-- Early morning (6am) and late night (10pm+) departures save money
-- 1-stop flights can be 30-50% cheaper than direct
-- Booking 3-6 weeks ahead is usually the sweet spot
-- Avoid holiday weekends (prices spike)
-
-## Key Rules:
-1. ALWAYS ask all questions before searching
-2. ALWAYS search multiple dates if user is flexible
-3. ALWAYS warn about hidden fees on budget carriers
-4. Present a clear comparison table
+## Make a Recommendation
+End with: "My recommendation: [option] because [reason]"
 """
 
 @mcp.prompt("compare_options")
@@ -1094,15 +1021,13 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
     """
     Search for flights by creating an offer request in the Duffel API.
 
-    IMPORTANT: Before using this tool, gather requirements from the user:
-    1. Confirm departure airport (ask about alternatives)
-    2. Ask about date flexibility (+/- days can save money)
-    3. Ask about priorities (price vs time vs convenience)
-    4. Ask about luggage needs (budget airlines charge extra)
-    5. Ask about direct flights vs connections
-
-    For finding the cheapest flights, search MULTIPLE date combinations
-    if the user is flexible, then compare results.
+    SMART AGENT TIPS:
+    - For "cheapest" requests: Search multiple date combinations (+/- 3 days)
+      and compare results. Don't just search one date.
+    - Present results with context: Note if bags aren't included, if there's
+      a long layover, or if it's a budget carrier with extra fees.
+    - Make recommendations based on the trade-offs you find.
+    - Only ask the user questions if truly needed (missing origin, vague dates).
 
     This tool searches for available flights based on itinerary (origin, destination, dates),
     passenger information, and preferences like cabin class. It supports optimization
@@ -1126,9 +1051,9 @@ async def duffel_search_flights(params: SearchFlightsInput, ctx: Context) -> str
         str: Formatted response containing flight offers and search details
 
     Examples:
-        - Use when: "Find flights from SGN to KUL departing Nov 21, returning Nov 23"
-        - Use when: "Search for the cheapest business class flights NYC to LON"
-        - Use when: "Find the best flights considering price, time, and stops"
+        - "Find flights from SGN to KUL departing Dec 24, returning Dec 26"
+        - "Search cheapest business class flights NYC to LON" (search multiple dates!)
+        - "Find best flights considering price, time, and stops"
     """
     try:
         await ctx.report_progress(0.1, "Validating search parameters...")
