@@ -1908,15 +1908,16 @@ async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) 
                     offers = data.get("data", {}).get("offers", [])
                     if offers:
                         # Get the cheapest offer for this date combo
-                        cheapest = min(offers, key=lambda o: float(o.get("total_amount", "999999")))
+                        cheapest_offer = min(offers, key=lambda o: float(o.get("total_amount", "999999")))
                         all_results.append({
                             "departure_date": dep_str,
                             "return_date": ret_str,
-                            "price": float(cheapest.get("total_amount", 0)),
-                            "currency": cheapest.get("total_currency", "USD"),
-                            "offer_id": cheapest.get("id"),
-                            "airline": cheapest.get("owner", {}).get("name", "Unknown"),
-                            "slices": cheapest.get("slices", []),
+                            "price": float(cheapest_offer.get("total_amount", 0)),
+                            "currency": cheapest_offer.get("total_currency", "USD"),
+                            "offer_id": cheapest_offer.get("id"),
+                            "airline": cheapest_offer.get("owner", {}).get("name", "Unknown"),
+                            "slices": cheapest_offer.get("slices", []),
+                            "baggage": _extract_baggage_info(cheapest_offer),
                             "is_target_date": (dep_date == target_dep and (ret_date == target_ret or ret_date is None))
                         })
                 except Exception as e:
@@ -1950,6 +1951,7 @@ async def duffel_flexible_search(params: FlexibleDateSearchInput, ctx: Context) 
         lines.append(f"- Depart: {cheapest['departure_date']}")
         if cheapest['return_date']:
             lines.append(f"- Return: {cheapest['return_date']}")
+        lines.append(f"- {cheapest.get('baggage', 'Baggage info not available')}")
         lines.append(f"- Offer ID: `{cheapest['offer_id']}`")
 
         # Add flight details
