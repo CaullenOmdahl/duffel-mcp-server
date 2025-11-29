@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies
 COPY duffel_mcp/pyproject.toml .
-RUN pip install fastmcp httpx pydantic starlette uvicorn
+RUN pip install fastmcp httpx pydantic starlette uvicorn redis
 
 # Copy server code
 COPY duffel_mcp/server.py .

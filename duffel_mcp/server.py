@@ -615,9 +615,6 @@ class CheckoutSession(BaseModel):
     booking_reference: Optional[str] = None
 
 
-# In-memory session storage (use Redis in production for persistence)
-checkout_sessions: Dict[str, CheckoutSession] = {}
-
 # Duffel Payments fee (approximately 2.9% for cards)
 DUFFEL_PAYMENTS_FEE_PERCENT = 0.029
 
@@ -626,6 +623,140 @@ CHECKOUT_SESSION_TTL_MINUTES = 30
 
 # Base URL for checkout links (set via environment or auto-detect)
 CHECKOUT_BASE_URL = os.getenv("CHECKOUT_BASE_URL", "")
+
+# Redis URL for session storage (optional - falls back to in-memory)
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+
+# ============================================================================
+# Session Storage (Redis with in-memory fallback)
+# ============================================================================
+
+class SessionStore:
+    """Abstract session storage with Redis and in-memory implementations."""
+
+    def __init__(self):
+        self._redis_client = None
+        self._memory_store: Dict[str, CheckoutSession] = {}
+        self._use_redis = False
+
+        if REDIS_URL:
+            try:
+                import redis
+                self._redis_client = redis.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+                # Test connection
+                self._redis_client.ping()
+                self._use_redis = True
+                logger.info("Redis session storage connected: %s", REDIS_URL.split("@")[-1] if "@" in REDIS_URL else REDIS_URL)
+            except Exception as e:
+                logger.warning("Redis connection failed, using in-memory storage: %s", str(e))
+                self._use_redis = False
+
+        if not self._use_redis:
+            logger.info("Using in-memory session storage")
+
+    def _session_key(self, session_id: str) -> str:
+        """Generate Redis key for a session."""
+        return f"checkout_session:{session_id}"
+
+    def _serialize_session(self, session: CheckoutSession) -> str:
+        """Serialize session to JSON for Redis storage."""
+        data = session.model_dump()
+        # Convert datetime objects to ISO format strings
+        data["created_at"] = session.created_at.isoformat()
+        data["expires_at"] = session.expires_at.isoformat()
+        return json.dumps(data)
+
+    def _deserialize_session(self, data: str) -> CheckoutSession:
+        """Deserialize session from JSON."""
+        parsed = json.loads(data)
+        # Convert ISO strings back to datetime
+        parsed["created_at"] = datetime.fromisoformat(parsed["created_at"])
+        parsed["expires_at"] = datetime.fromisoformat(parsed["expires_at"])
+        # Convert passenger dicts back to CheckoutPassenger objects
+        parsed["passengers"] = [CheckoutPassenger(**p) for p in parsed["passengers"]]
+        return CheckoutSession(**parsed)
+
+    def save(self, session: CheckoutSession) -> None:
+        """Save a checkout session."""
+        if self._use_redis:
+            try:
+                ttl_seconds = CHECKOUT_SESSION_TTL_MINUTES * 60
+                self._redis_client.setex(
+                    self._session_key(session.session_id),
+                    ttl_seconds,
+                    self._serialize_session(session)
+                )
+                logger.debug("Session saved to Redis: %s", session.session_id)
+            except Exception as e:
+                logger.error("Redis save failed, falling back to memory: %s", str(e))
+                self._memory_store[session.session_id] = session
+        else:
+            self._memory_store[session.session_id] = session
+
+    def get(self, session_id: str) -> Optional[CheckoutSession]:
+        """Get a checkout session, checking for expiry."""
+        if self._use_redis:
+            try:
+                data = self._redis_client.get(self._session_key(session_id))
+                if data:
+                    session = self._deserialize_session(data)
+                    # Redis TTL handles expiry, but double-check
+                    if session.expires_at < datetime.utcnow():
+                        self.delete(session_id)
+                        return None
+                    return session
+                return None
+            except Exception as e:
+                logger.error("Redis get failed: %s", str(e))
+                return self._memory_store.get(session_id)
+        else:
+            session = self._memory_store.get(session_id)
+            if session and session.expires_at < datetime.utcnow():
+                session.status = "expired"
+                del self._memory_store[session_id]
+                return None
+            return session
+
+    def update(self, session: CheckoutSession) -> None:
+        """Update an existing session (same as save, preserves TTL in Redis)."""
+        if self._use_redis:
+            try:
+                # Get remaining TTL
+                ttl = self._redis_client.ttl(self._session_key(session.session_id))
+                if ttl > 0:
+                    self._redis_client.setex(
+                        self._session_key(session.session_id),
+                        ttl,
+                        self._serialize_session(session)
+                    )
+                else:
+                    # Session expired, save with new TTL
+                    self.save(session)
+                logger.debug("Session updated in Redis: %s", session.session_id)
+            except Exception as e:
+                logger.error("Redis update failed: %s", str(e))
+                self._memory_store[session.session_id] = session
+        else:
+            self._memory_store[session.session_id] = session
+
+    def delete(self, session_id: str) -> None:
+        """Delete a checkout session."""
+        if self._use_redis:
+            try:
+                self._redis_client.delete(self._session_key(session_id))
+            except Exception as e:
+                logger.error("Redis delete failed: %s", str(e))
+        if session_id in self._memory_store:
+            del self._memory_store[session_id]
+
+
+# Global session store instance
+session_store = SessionStore()
 
 # ============================================================================
 # Shared Utility Functions
@@ -2657,13 +2788,8 @@ def _calculate_payment_amount(offer_amount: float, currency: str) -> str:
 
 
 def _get_session(session_id: str) -> Optional[CheckoutSession]:
-    """Get a checkout session, checking for expiry."""
-    session = checkout_sessions.get(session_id)
-    if session and session.expires_at < datetime.utcnow():
-        session.status = "expired"
-        del checkout_sessions[session_id]
-        return None
-    return session
+    """Get a checkout session from the session store."""
+    return session_store.get(session_id)
 
 
 # ============================================================================
@@ -3238,9 +3364,11 @@ async def confirm_checkout(request: Request) -> JSONResponse:
 
         if payment_result.get("status") != "succeeded":
             session.status = "failed"
+            session_store.update(session)
             return JSONResponse({"success": False, "error": "Payment confirmation failed"}, status_code=400)
 
         session.status = "paid"
+        session_store.update(session)
         logger.info("Payment confirmed, creating order for offer: %s", session.offer_id)
 
         # 2. Create the order using balance payment
@@ -3255,6 +3383,7 @@ async def confirm_checkout(request: Request) -> JSONResponse:
         session.status = "confirmed"
         session.order_id = order_result.get("id")
         session.booking_reference = order_result.get("booking_reference")
+        session_store.update(session)
 
         logger.info(
             "Order created: ID=%s, Reference=%s",
@@ -3271,6 +3400,7 @@ async def confirm_checkout(request: Request) -> JSONResponse:
     except httpx.HTTPStatusError as e:
         logger.error("Checkout confirmation failed: %s", e.response.text)
         session.status = "failed"
+        session_store.update(session)
         try:
             error_data = e.response.json()
             error_msg = error_data.get("errors", [{}])[0].get("message", "Booking failed")
@@ -3280,6 +3410,7 @@ async def confirm_checkout(request: Request) -> JSONResponse:
     except Exception as e:
         logger.exception("Checkout confirmation error: %s", str(e))
         session.status = "failed"
+        session_store.update(session)
         return JSONResponse({"success": False, "error": "An unexpected error occurred"}, status_code=500)
 
 
@@ -3430,7 +3561,7 @@ async def duffel_create_checkout(params: CreateCheckoutInput, ctx: Context) -> s
             status="pending"
         )
 
-        checkout_sessions[session_id] = session
+        session_store.save(session)
 
         await ctx.report_progress(0.9, "Generating checkout URL...")
 

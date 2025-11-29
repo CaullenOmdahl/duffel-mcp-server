@@ -10,7 +10,7 @@ Duffel MCP server that enables LLMs to search for flights, retrieve offers, and 
 
 ```bash
 # Install dependencies
-pip install fastmcp httpx pydantic starlette uvicorn
+pip install fastmcp httpx pydantic starlette uvicorn redis
 # Or with uv
 uv pip install -e duffel_mcp/
 
@@ -60,10 +60,11 @@ The `duffel_create_checkout` tool creates a hosted checkout page:
 **Key models:**
 - `CheckoutSession`: Stored session with offer, passengers, payment intent
 - `CreateCheckoutInput`: Input for `duffel_create_checkout` tool
-- `checkout_sessions`: In-memory session storage (dict)
+- `SessionStore`: Redis-backed session storage with in-memory fallback
 
 **Environment variables:**
 - `CHECKOUT_BASE_URL`: Full URL for checkout links (e.g., `https://your-app.railway.app`)
+- `REDIS_URL`: Redis connection URL for session persistence (optional, falls back to in-memory)
 
 ### Optimization Strategies
 
