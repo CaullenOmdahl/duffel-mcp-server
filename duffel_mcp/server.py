@@ -47,35 +47,18 @@ DEFAULT_TIMEOUT = 30.0
 # Get API key from environment
 DUFFEL_API_KEY = os.getenv("DUFFEL_API_KEY_LIVE", "")
 
-# Lifespan management for persistent HTTP client
-@asynccontextmanager
-async def app_lifespan(server: FastMCP):
-    """Manage persistent HTTP client for the server's lifetime."""
-    logger.info("Initializing Duffel MCP server...")
-
-    if not DUFFEL_API_KEY:
-        logger.warning("DUFFEL_API_KEY_LIVE not set - API calls will fail")
-    else:
-        logger.info("API key configured (ends with ...%s)", DUFFEL_API_KEY[-4:])
-
-    headers = {
+# HTTP client headers for Duffel API
+def _get_http_headers() -> Dict[str, str]:
+    """Get headers for Duffel API requests."""
+    return {
         "Authorization": f"Bearer {DUFFEL_API_KEY}",
         "Duffel-Version": API_VERSION,
         "Accept": "application/json",
         "Accept-Encoding": "gzip"
     }
-    async with httpx.AsyncClient(
-        base_url=API_BASE_URL,
-        timeout=DEFAULT_TIMEOUT,
-        headers=headers
-    ) as client:
-        logger.info("HTTP client initialized with base URL: %s", API_BASE_URL)
-        yield {"http_client": client}
 
-    logger.info("Duffel MCP server shutting down")
-
-# Initialize the MCP server with lifespan
-mcp = FastMCP("duffel_mcp", lifespan=app_lifespan)
+# Initialize the MCP server
+mcp = FastMCP("duffel_mcp")
 
 
 # ============================================================================
@@ -470,31 +453,32 @@ async def _make_api_request(
     params: Optional[Dict[str, Any]] = None,
     json_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Make an authenticated request to the Duffel API using the persistent client."""
+    """Make an authenticated request to the Duffel API."""
     if not DUFFEL_API_KEY:
         logger.error("API key not configured")
         raise ToolError("DUFFEL_API_KEY_LIVE environment variable is not set")
 
-    # Get the persistent HTTP client from lifespan state
-    client: httpx.AsyncClient = ctx.request_context.lifespan_state["http_client"]
-
-    headers = {}
+    headers = _get_http_headers()
     if json_data:
         headers["Content-Type"] = "application/json"
 
     logger.debug("API request: %s /%s", method, endpoint)
 
-    response = await client.request(
-        method,
-        f"/{endpoint}",
-        headers=headers,
-        params=params,
-        json=json_data
-    )
+    async with httpx.AsyncClient(
+        base_url=API_BASE_URL,
+        timeout=DEFAULT_TIMEOUT
+    ) as client:
+        response = await client.request(
+            method,
+            f"/{endpoint}",
+            headers=headers,
+            params=params,
+            json=json_data
+        )
 
-    logger.debug("API response: %s %s", response.status_code, endpoint)
-    response.raise_for_status()
-    return response.json()
+        logger.debug("API response: %s %s", response.status_code, endpoint)
+        response.raise_for_status()
+        return response.json()
 
 def _handle_api_error(e: Exception, ctx: Optional[Context] = None) -> str:
     """Format API errors consistently and log them."""
