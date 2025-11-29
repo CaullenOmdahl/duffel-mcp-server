@@ -1,0 +1,78 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/manifest.schema.json",
+  "name": "duffel-flights",
+  "display_name": "Duffel Flight Search",
+  "version": "1.0.0",
+  "description": "Search for flights, compare prices, and create bookings using the Duffel API. Includes optimization strategies to find the cheapest, fastest, or best overall flights.",
+  "author": {
+    "name": "Your Name"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/your-username/flights",
+  "runtime": "python",
+  "entry_point": "server.py",
+  "configuration": {
+    "properties": {
+      "DUFFEL_API_KEY_LIVE": {
+        "type": "string",
+        "description": "Your Duffel API key (get one at duffel.com)",
+        "required": true,
+        "secret": true
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "duffel_search_flights",
+      "description": "Search for flights with optimization strategies"
+    },
+    {
+      "name": "duffel_analyze_offers",
+      "description": "Analyze and rank flight offers"
+    },
+    {
+      "name": "duffel_get_offer",
+      "description": "Get details for a specific offer"
+    },
+    {
+      "name": "duffel_list_offers",
+      "description": "List offers from a search"
+    },
+    {
+      "name": "duffel_create_order",
+      "description": "Book a flight"
+    },
+    {
+      "name": "duffel_list_airlines",
+      "description": "List available airlines"
+    }
+  ],
+  "resources": [
+    {
+      "uri_template": "duffel://airlines",
+      "description": "List of all available airlines"
+    },
+    {
+      "uri_template": "duffel://airlines/{iata_code}",
+      "description": "Airline details by IATA code"
+    },
+    {
+      "uri_template": "duffel://places/{query}",
+      "description": "Search airports and cities"
+    }
+  ],
+  "prompts": [
+    {
+      "name": "book_round_trip",
+      "description": "Guided workflow for booking round-trip flights"
+    },
+    {
+      "name": "find_cheapest",
+      "description": "Find the most affordable flight options"
+    },
+    {
+      "name": "compare_options",
+      "description": "Compare and analyze multiple flight options"
+    }
+  ]
+}

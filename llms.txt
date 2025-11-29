@@ -1,0 +1,1294 @@
+### POST /bookings
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Creates a booking by finalizing the purchase of a quote. This endpoint requires the quote ID from a previous step and additional guest and contact information.
+
+```APIDOC
+## POST /bookings
+
+### Description
+Finalizes the purchase of a quote by creating a booking. Requires the `quote_id` from a previous step, along with guest details, contact information, and any special requests.
+
+### Method
+POST
+
+### Endpoint
+/bookings
+
+### Parameters
+#### Request Body
+- **quote_id** (string) - Required - The ID of the quote to book.
+- **phone_number** (string) - Required - The phone number of the contact person.
+- **guests** (array) - Required - An array of guest objects, each containing `given_name`, `family_name`, and `born_on`.
+  - **given_name** (string) - Required - The first name of the guest.
+  - **family_name** (string) - Required - The last name of the guest.
+  - **born_on** (string) - Required - The date of birth of the guest in YYYY-MM-DD format.
+- **email** (string) - Required - The email address of the contact person.
+- **accommodation_special_requests** (string) - Optional - Special requests for the accommodation.
+
+### Request Example
+```json
+{
+  "quote_id": "QUOTE_ID",
+  "phone_number": "+442080160509",
+  "guests": [
+    {
+      "given_name": "Amelia",
+      "family_name": "Earhart",
+      "born_on": "1987-07-24"
+    }
+  ],
+  "email": "amelia.earhart@duffel.com",
+  "accommodation_special_requests": "2:00 PM early check-in required"
+}
+```
+
+### Response
+#### Success Response (200)
+Returns all information needed to display a booking confirmation page, including details about the booking, accommodation, and any specific instructions like key collection.
+
+#### Response Example
+```json
+{
+  "booking_id": "bfnk_1Kj6SgM94oEfzG5hJ",
+  "status": "confirmed",
+  "created_at": "2023-10-27T10:00:00Z",
+  "confirmation_email_sent": true,
+  "accommodation_details": {
+    "name": "City Hotel",
+    "address": "123 Main St, Anytown, USA"
+  },
+  "key_collection_instructions": "Please collect the keys from the front desk.",
+  "guest_details": [
+    {
+      "given_name": "Amelia",
+      "family_name": "Earhart",
+      "born_on": "1987-07-24"
+    }
+  ]
+}
+```
+```
+
+--------------------------------
+
+### 1. Search for Accommodation
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Search for available accommodation based on criteria such as number of guests, rooms, dates, and location. The search_result_id is required for the next step.
+
+```APIDOC
+## POST /api/stays/search
+
+### Description
+Searches for available accommodation based on provided criteria.
+
+### Method
+POST
+
+### Endpoint
+/api/stays/search
+
+### Parameters
+#### Request Body
+- **rooms** (integer) - Required - The number of rooms to search for.
+- **location** (object) - Required - Location details for the search.
+  - **radius** (integer) - Required - The search radius in kilometers.
+  - **geographic_coordinates** (object) - Required - Latitude and longitude coordinates.
+    - **longitude** (float) - Required - Longitude of the search location.
+    - **latitude** (float) - Required - Latitude of the search location.
+- **check_out_date** (string) - Required - The check-out date in YYYY-MM-DD format.
+- **check_in_date** (string) - Required - The check-in date in YYYY-MM-DD format.
+- **guests** (array) - Required - An array of guest objects.
+  - **type** (string) - Required - The type of guest (e.g., "adult").
+
+### Request Example
+```json
+{
+  "rooms": 1,
+  "location": {
+    "radius": 2,
+    "geographic_coordinates": {
+      "longitude": -0.1416,
+      "latitude": 51.5071
+    }
+  },
+  "check_out_date": "2023-12-07",
+  "check_in_date": "2023-12-04",
+  "guests": [
+    {"type": "adult"},
+    {"type": "adult"}
+  ]
+}
+```
+
+### Response
+#### Success Response (200)
+- **search_result_id** (string) - The ID of the search result, used for fetching rates.
+```
+
+--------------------------------
+
+### 2. Retrieve Available Room Rates
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Fetches all available room options and their rates for a given accommodation search result. The rate_id is needed for the next step.
+
+```APIDOC
+## GET /api/stays/search-results/{search_result_id}/rates
+
+### Description
+Retrieves all available rooms and their rates for a specific accommodation search result.
+
+### Method
+GET
+
+### Endpoint
+/api/stays/search-results/{search_result_id}/rates
+
+### Parameters
+#### Path Parameters
+- **search_result_id** (string) - Required - The ID of the search result from the previous step.
+
+### Response
+#### Success Response (200)
+- **rate_id** (string) - The ID of the chosen rate, used for requesting a quote.
+```
+
+--------------------------------
+
+### Create Offer Request - curl
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+Creates an offer request to search for flights using curl. This command-line tool allows for direct API interaction, requiring similar parameters as the JavaScript example for itinerary and passenger details.
+
+```curl
+curl -X POST https://api.duffel.com/offer-requests \
+  -H "Accept: application/vnd.duffel+json;version=v1" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d $'{'
+  "data": {
+    "slices": [
+      {
+        "origin": "NYC",
+        "destination": "ATL",
+        "departure_date": "2021-06-21"
+      },
+      {
+        "origin": "ATL",
+        "destination": "NYC",
+        "departure_date": "2021-07-21"
+      }
+    ],
+    "passengers": [
+      { "type": "adult" },
+      { "type": "adult" },
+      { "type": "child", "age": 1 }
+    ],
+    "cabin_class": "business"
+  }
+}'
+```
+
+--------------------------------
+
+### Fetch Available Room Rates
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Retrieves all available room and rate options for a given accommodation using the `search_result_id`. Accommodations can have multiple room types, and each room can have various rates with different inclusions (e.g., breakfast, refundability). The `rate_id` is crucial for the next step.
+
+```javascript
+duffel.stays.searchResults.fetchAllRates(SEARCH_RESULT_ID)
+```
+
+```curl
+curl -X GET https://api.duffel.com/stays/search-results/SEARCH_RESULT_ID/available-rates \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
+--------------------------------
+
+### Search for Accommodation with Duffel Stays
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Searches for available accommodation based on location, dates, and number of guests. Requires location coordinates (latitude, longitude, radius) or accommodation IDs, check-in/out dates, and guest information. Returns a list of search results, from which a `search_result_id` is extracted for the next step.
+
+```javascript
+duffel.stays.search({
+  rooms: 1,
+  location: {
+    radius: 2,
+    geographic_coordinates: {
+      longitude: -0.1416,
+      latitude: 51.5071
+    }
+  },
+  check_out_date: "2023-12-07",
+  check_in_date: "2023-12-04",
+  guests: [{type: "adult"}, {type: "adult"}]
+})
+```
+
+```curl
+curl -X POST https://api.duffel.com/stays/search \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ 
+    "rooms": 1, 
+    "location": {
+      "radius": 2,
+      "geographic_coordinates": {
+        "longitude": -0.1416,
+        "latitude": 51.5071
+      }
+    },
+    "check_out_date": "2023-12-07",
+    "check_in_date": "2023-12-04",
+    "guests": [{"type": "adult"}, {"type": "adult"}]
+  }'
+```
+
+--------------------------------
+
+### Searching for Flights - Offer Request Creation
+
+Source: https://duffel.com/docs/guides/quick-start
+
+This section details how to create an offer request to search for flights. It explains the structure of the request payload, including slices (journeys with origin, destination, and date) and passenger information. The example provided demonstrates a request for a round trip from New York City to Atlanta in business class for three passengers.
+
+```APIDOC
+## POST /offer-requests
+
+### Description
+Creates an offer request to search for flights based on specified criteria.
+
+### Method
+POST
+
+### Endpoint
+/offer-requests
+
+### Parameters
+#### Request Body
+- **slices** (array) - Required - An array of journey segments, each with `origin`, `destination`, and `departure_date`.
+- **passengers** (array) - Required - An array of passenger objects, specifying `type` (e.g., 'adult') or `age` for minors.
+- **cabin_class** (string) - Optional - The desired cabin class (e.g., 'economy', 'business').
+
+### Request Example
+```json
+{
+  "slices": [
+    {
+      "origin": "NYC",
+      "destination": "ATL",
+      "departure_date": "2021-06-21"
+    },
+    {
+      "origin": "ATL",
+      "destination": "NYC",
+      "departure_date": "2021-07-21"
+    }
+  ],
+  "passengers": [
+    { "type": "adult" },
+    { "type": "adult" },
+    { "age": 1 }
+  ],
+  "cabin_class": "business"
+}
+```
+
+### Response
+#### Success Response (201 Created)
+- **id** (string) - The unique identifier for the offer request.
+- **offers** (array) - An array of available flight offers matching the request.
+- **passengers** (array) - An array of passenger objects, each with an `id`.
+
+#### Response Example
+```json
+{
+  "id": "oer_123abc",
+  "offers": [
+    {
+      "id": "off_456def",
+      "total_currency": "USD",
+      "total_amount": "500.00"
+    }
+  ],
+  "passengers": [
+    { "id": "pas_789ghi" },
+    { "id": "pas_101jkl" },
+    { "id": "pas_112mno" }
+  ]
+}
+```
+```
+
+--------------------------------
+
+### Selecting an Offer - Get Single Offer
+
+Source: https://duffel.com/docs/guides/quick-start
+
+This endpoint allows you to retrieve the most up-to-date version of a specific offer using its ID. It's recommended to call this before proceeding with booking to ensure offer validity and get the latest pricing.
+
+```APIDOC
+## GET /offers/{offer_id}
+
+### Description
+Retrieves the details of a specific flight offer using its unique ID.
+
+### Method
+GET
+
+### Endpoint
+/offers/{offer_id}
+
+### Parameters
+#### Path Parameters
+- **offer_id** (string) - Required - The unique identifier of the offer.
+
+### Response
+#### Success Response (200 OK)
+- **id** (string) - The unique identifier of the offer.
+- **total_currency** (string) - The currency of the total price.
+- **total_amount** (string) - The total price of the offer.
+
+#### Response Example
+```json
+{
+  "id": "off_456def",
+  "total_currency": "USD",
+  "total_amount": "510.00"
+}
+```
+```
+
+--------------------------------
+
+### Create Booking in Duffel (JavaScript)
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+This JavaScript code snippet demonstrates how to create a booking using the Duffel API. It requires a quote ID, customer's phone number, guest details (name and date of birth), email, and any special accommodation requests. This is a client-side representation of the API call.
+
+```javascript
+duffel.stays.bookings.create({
+  quote_id: QUOTE_ID,
+  phone_number: "+442080160509",
+  guests: [
+    {
+      given_name: "Amelia",
+      family_name: "Earhart",
+      born_on: "1987-07-24"
+    }
+  ],
+  email: "amelia.earhart@duffel.com",
+  accommodation_special_requests: "2:00 PM early check-in required"
+})
+```
+
+--------------------------------
+
+### Get a Single Offer
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+Retrieves the most up-to-date version of a specific flight offer.
+
+```APIDOC
+## GET /offers/{offer_id}
+
+### Description
+Retrieves the latest version of a specific flight offer using its ID.
+
+### Method
+GET
+
+### Endpoint
+/offers/{offer_id}
+
+### Parameters
+#### Path Parameters
+- **offer_id** (string) - Required - The unique identifier of the offer to retrieve.
+
+### Response
+#### Success Response (200)
+- **id** (string) - The unique identifier of the offer.
+- **total_currency** (string) - The currency of the total offer price.
+- **total_amount** (string) - The total price of the offer.
+
+#### Response Example
+```json
+{
+  "id": "off_12345",
+  "total_currency": "USD",
+  "total_amount": "510.00"
+}
+```
+```
+
+--------------------------------
+
+### Get a Single Offer - Example Usage
+
+Source: https://duffel.com/docs/api/v2/offers
+
+Demonstrates how to retrieve detailed, up-to-date information for a specific offer using its unique identifier. This is crucial for obtaining the latest pricing and service details before booking.
+
+```http
+GET https://api.duffel.com/offers/off_00009htYpSCXrwaB9DnUm0?return_available_services=true
+
+```
+
+--------------------------------
+
+### Create Offer Request - curl
+
+Source: https://duffel.com/docs/guides/quick-start
+
+Demonstrates creating an offer request using curl for searching flights. It specifies flight itinerary details like origin, destination, and dates, along with passenger information and preferred cabin class. The output includes an offer request ID.
+
+```curl
+curl -X POST https://api.duffel.com/offer-requests \
+  -H "Authorization: Bearer $DUFFEL_ACCESS_TOKEN" \
+  -H "Accept: application/vnd.duffel+json; version=v1" \
+  -H "Content-Type: application/json" \
+  -d '{ \
+    "data": { \
+      "slices": [ \
+        { \
+          "origin": "NYC", \
+          "destination": "ATL", \
+          "departure_date": "2021-06-21" \
+        }, \
+        { \
+          "origin": "ATL", \
+          "destination": "NYC", \
+          "departure_date": "2021-07-21" \
+        } \
+      ], \
+      "passengers": [ \
+        { "type": "adult" }, \
+        { "type": "adult" }, \
+        { "type": "child", "age": 1 } \
+      ], \
+      "cabin_class": "business" \
+    } \
+  }'
+```
+
+--------------------------------
+
+### Request a Quote for a Selected Rate
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Requests a quote for a specific accommodation rate by providing the `rate_id`. This step confirms the rate's availability and price before actual booking, mitigating potential issues like sold-out rooms or price changes. A successful request returns a `quote_id`.
+
+```javascript
+duffel.stays.quotes.create(RATE_ID)
+```
+
+```curl
+curl -X POST https://api.duffel.com/stays/quotes \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ 
+    "rate_id": "RATE_ID"
+  }'
+```
+
+--------------------------------
+
+### Get Single Offer - curl
+
+Source: https://duffel.com/docs/guides/quick-start
+
+Fetches a specific flight offer using curl, identified by its unique OFFER_ID. This command retrieves the latest offer details, including current pricing under `total_currency` and `total_amount`, ensuring accuracy before booking.
+
+```curl
+curl -G https://api.duffel.com/offers/$OFFER_ID \
+  -H "Authorization: Bearer $DUFFEL_ACCESS_TOKEN" \
+  -H "Accept: application/vnd.duffel+json; version=v1"
+```
+
+--------------------------------
+
+### Search for Flights
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+Initiates a search for flights based on itinerary and passenger information.
+
+```APIDOC
+## POST /offer_requests
+
+### Description
+Creates an offer request to search for flights based on specified criteria.
+
+### Method
+POST
+
+### Endpoint
+/offer_requests
+
+### Parameters
+#### Request Body
+- **slices** (array) - Required - An array of flight itineraries, each specifying origin, destination, and departure date.
+- **passengers** (array) - Required - An array of passenger objects, specifying their type (e.g., "adult") or age for minors.
+- **cabin_class** (string) - Optional - The desired cabin class (e.g., "economy", "business").
+
+### Request Example
+```json
+{
+  "slices": [
+    {
+      "origin": "NYC",
+      "destination": "ATL",
+      "departure_date": "2021-06-21"
+    },
+    {
+      "origin": "ATL",
+      "destination": "NYC",
+      "departure_date": "2021-07-21"
+    }
+  ],
+  "passengers": [
+    { "type": "adult" },
+    { "type": "adult" },
+    { "age": 1 }
+  ],
+  "cabin_class": "business"
+}
+```
+
+### Response
+#### Success Response (200)
+- **id** (string) - The unique identifier for the offer request.
+- **offers** (array) - An array of available flight offers.
+- **passengers** (array) - An array of passenger objects, each with an `id`.
+
+#### Response Example
+```json
+{
+  "id": "orq_12345",
+  "offers": [
+    {
+      "id": "off_12345",
+      "total_currency": "USD",
+      "total_amount": "500.00"
+    }
+  ],
+  "passengers": [
+    { "id": "psr_12345", "type": "adult" },
+    { "id": "psr_67890", "type": "adult" },
+    { "id": "psr_abcde", "age": 1 }
+  ]
+}
+```
+```
+
+--------------------------------
+
+### Create an Order
+
+Source: https://duffel.com/docs/guides/quick-start
+
+This endpoint is used to create an order (booking) in the Duffel API. It requires the offer ID, passenger details, and payment information.
+
+```APIDOC
+## POST /orders
+
+### Description
+Creates an order (booking) for a selected offer, including passenger and payment details.
+
+### Method
+POST
+
+### Endpoint
+/orders
+
+### Parameters
+#### Request Body
+- **selected_offers** (array of strings) - Required - An array containing a single offer ID.
+- **payments** (array of objects) - Required - An array of payment objects. Currently supports a single payment with `type` ('arc_bsp_cash' or 'balance'), `currency` (ISO 4217 format), and `amount`.
+- **passengers** (array of objects) - Required - An array of passenger objects, each including `id`, `phone_number`, `email`, `born_on`, `title`, `gender`, `family_name`, and `given_name`. For infants, `infant_passenger_id` must be specified and linked to a responsible adult.
+
+### Request Example
+```json
+{
+  "selected_offers": ["OFFER_ID"],
+  "payments": [
+    {
+      "type": "balance",
+      "currency": "TOTAL_CURRENCY",
+      "amount": "TOTAL_AMOUNT"
+    }
+  ],
+  "passengers": [
+    {
+      "phone_number": "+442080160508",
+      "email": "tony@example.com",
+      "born_on": "1980-07-24",
+      "title": "mr",
+      "gender": "m",
+      "family_name": "Stark",
+      "given_name": "Tony",
+      "infant_passenger_id": "INFANT_PASSENGER_ID",
+      "id": "ADULT_PASSENGER_ID_1"
+    },
+    {
+      "phone_number": "+442080160509",
+      "email": "potts@example.com",
+      "born_on": "1983-11-02",
+      "title": "mrs",
+      "gender": "m",
+      "family_name": "Potts",
+      "given_name": "Pepper",
+      "id": "ADULT_PASSENGER_ID_2"
+    },
+    {
+      "phone_number": "+442080160506",
+      "email": "morgan@example.com",
+      "born_on": "2019-08-24",
+      "title": "mrs",
+      "gender": "f",
+      "family_name": "Stark",
+      "given_name": "Morgan",
+      "id": "INFANT_PASSENGER_ID"
+    }
+  ]
+}
+```
+
+### Response
+#### Success Response (201 Created)
+- **id** (string) - The unique identifier for the created order.
+- **offer_id** (string) - The ID of the offer used for booking.
+- **passengers** (array of objects) - Details of the passengers booked.
+- **payments** (array of objects) - Details of the payments made.
+- **status** (string) - The current status of the order (e.g., 'pending', 'confirmed').
+
+#### Response Example
+```json
+{
+  "id": "ord_01g0j0j0j0j0j0j0j0j0j0j0",
+  "offer_id": "ofr_12345",
+  "passengers": [
+    {
+      "id": "ADT_1",
+      "given_name": "Tony",
+      "family_name": "Stark"
+    }
+  ],
+  "payments": [
+    {
+      "type": "balance",
+      "currency": "USD",
+      "amount": "100.00"
+    }
+  ],
+  "status": "pending"
+}
+```
+```
+
+--------------------------------
+
+### Get Single Offer - curl
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+Retrieves a specific offer using curl, allowing for direct API interaction to get the latest offer details. Replace $OFFER_ID with the actual offer ID to fetch the current pricing and availability. The response includes total_currency and total_amount.
+
+```curl
+curl -X GET https://api.duffel.com/offers/$OFFER_ID \
+  -H "Accept: application/vnd.duffel+json;version=v1" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
+--------------------------------
+
+### Create an Order
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+This endpoint is used to create a booking (order) using a selected offer, passenger information, and payment details.
+
+```APIDOC
+## POST /orders
+
+### Description
+Creates an order (booking) for a selected offer with passenger and payment details.
+
+### Method
+POST
+
+### Endpoint
+/orders
+
+### Parameters
+#### Request Body
+- **selected_offers** (array[string]) - Required - An array containing the ID of the offer to book.
+- **payments** (array[object]) - Required - An array of payment objects.
+  - **type** (string) - Required - The type of payment ('arc_bsp_cash' or 'balance').
+  - **currency** (string) - Required - The currency of the payment in ISO 4217 format.
+  - **amount** (string) - Required - The total amount of the order.
+- **passengers** (array[object]) - Required - An array of passenger objects.
+  - **id** (string) - Required - The passenger's ID from the Offer Request.
+  - **phone_number** (string) - Required - The passenger's phone number.
+  - **email** (string) - Required - The passenger's email address.
+  - **born_on** (string) - Required - The passenger's date of birth (YYYY-MM-DD).
+  - **title** (string) - Required - The passenger's title (e.g., 'mr', 'mrs').
+  - **gender** (string) - Required - The passenger's gender ('m' or 'f').
+  - **family_name** (string) - Required - The passenger's family name.
+  - **given_name** (string) - Required - The passenger's given name.
+  - **infant_passenger_id** (string) - Optional - The ID of the infant if this passenger is responsible for one.
+
+### Request Example
+```json
+{
+  "selected_offers": ["$OFFER_ID"],
+  "payments": [
+    {
+      "type": "balance",
+      "currency": "$TOTAL_CURRENCY",
+      "amount": "$TOTAL_AMOUNT"
+    }
+  ],
+  "passengers": [
+    {
+      "phone_number": "+442080160508",
+      "email": "tony@example.com",
+      "born_on": "1980-07-24",
+      "title": "mr",
+      "gender": "m",
+      "family_name": "Stark",
+      "given_name": "Tony",
+      "infant_passenger_id": "INFANT_PASSENGER_ID",
+      "id": "ADULT_PASSENGER_ID_1"
+    },
+    {
+      "phone_number": "+442080160509",
+      "email": "potts@example.com",
+      "born_on": "1983-11-02",
+      "title": "mrs",
+      "gender": "m",
+      "family_name": "Potts",
+      "given_name": "Pepper",
+      "id": "ADULT_PASSENGER_ID_2"
+    },
+    {
+      "phone_number": "+442080160506",
+      "email": "morgan@example.com",
+      "born_on": "2019-08-24",
+      "title": "mrs",
+      "gender": "f",
+      "family_name": "Stark",
+      "given_name": "Morgan",
+      "id": "INFANT_PASSENGER_ID"
+    }
+  ]
+}
+```
+
+### Response
+#### Success Response (200)
+- **id** (string) - The unique identifier for the created order.
+- **offer_id** (string) - The ID of the offer used for the booking.
+- **passenger_ids** (array[string]) - An array of passenger IDs included in the order.
+- **total_amount** (string) - The total amount charged for the order.
+- **total_currency** (string) - The currency of the total amount.
+- **status** (string) - The current status of the order (e.g., 'pending', 'booked').
+
+#### Response Example
+```json
+{
+  "id": "ord_01FK988S23N6Y8Q17Y3V69373A",
+  "offer_id": "off_01FK987W99171A43T93224V245",
+  "passenger_ids": [
+    "psg_01FK988S23N6Y8Q17Y3V69373B",
+    "psg_01FK988S23N6Y8Q17Y3V69373C",
+    "psg_01FK988S23N6Y8Q17Y3V69373D"
+  ],
+  "total_amount": "100.00",
+  "total_currency": "USD",
+  "status": "pending"
+}
+```
+```
+
+--------------------------------
+
+### 3. Request a Final Quote
+
+Source: https://duffel.com/docs/guides/getting-started-with-stays
+
+Requests a quote for a selected rate to confirm availability and price before booking. The quote_id is used for creating a booking.
+
+```APIDOC
+## POST /api/stays/quotes
+
+### Description
+Requests a quote for a selected rate to confirm availability and price.
+
+### Method
+POST
+
+### Endpoint
+/api/stays/quotes
+
+### Parameters
+#### Request Body
+- **rate_id** (string) - Required - The ID of the rate selected in the previous step.
+
+### Request Example
+```json
+{
+  "rate_id": "RATE_ID"
+}
+```
+
+### Response
+#### Success Response (200)
+- **quote_id** (string) - The ID of the quote, used for creating a booking.
+```
+
+--------------------------------
+
+### Create Offer Request - JavaScript
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+Creates an offer request to search for flights based on itinerary and passenger details. It requires origin, destination, departure dates, passenger types, and cabin class. The response includes an offer request ID and available offers.
+
+```javascript
+duffel.offerRequests.create({
+  slices : [
+    {
+      origin: "NYC",
+      destination: "ATL",
+      departure_date: "2021-06-21"
+    },
+    {
+      origin: "ATL",
+      destination: "NYC",
+      departure_date: "2021-07-21"
+    }
+  ],
+  passengers: [{ type: "adult" }, { type: "adult" }, { age: 1 }],
+  cabin_class: "business",
+})
+```
+
+--------------------------------
+
+### Example: Missing Authorization Header
+
+Source: https://duffel.com/docs/api/overview/response-handling
+
+Example response when the 'Authorization' header is missing or invalid.
+
+```APIDOC
+## Example: Missing Authorization Header
+
+### Description
+This example shows the response when the `Authorization` header is missing or invalid.
+
+### Response Example
+```json
+{
+  "errors": [
+    {
+      "code": "missing_authorization_header",
+      "documentation_url": "https://duffel.com/docs/api/overview/response-handling",
+      "message": "The 'Authorization' header needs to be set and contain a valid API token.",
+      "title": "Missing authorization header",
+      "type": "authentication_error"
+    }
+  ],
+  "meta": {
+    "request_id": "FZW0H3HdJwKk5HMAAKxB",
+    "status": 401
+  }
+}
+```
+```
+
+--------------------------------
+
+### Available Services Example (Baggage)
+
+Source: https://duffel.com/docs/api/offers
+
+Shows an example of available services for a flight offer, specifically detailing baggage options with pricing information. This includes the total cost and associated segment and passenger IDs.
+
+```json
+{
+    "type": "baggage",
+    "total_currency": "GBP",
+    "total_amount": "15.00",
+    "segment_ids": [
+      "seg_00009hj8USM7Ncg31cB456"
+    ],
+    "passenger_ids": [
+      // ... passenger IDs
+    ]
+  }
+```
+
+--------------------------------
+
+### Authentication Error Example
+
+Source: https://duffel.com/docs/api/overview/response-handling/order-and-booking-creation
+
+An example of an `authentication_error` response when the authorization header is missing or invalid.
+
+```APIDOC
+## Authentication Error
+
+### Description
+
+This error occurs when the `Authorization` header is not provided or contains an invalid API token.
+
+### Method
+
+Any
+
+### Endpoint
+
+Any
+
+### Response
+
+#### Success Response (401)
+
+- **`errors`** (array) - A list of errors. Each error object contains:
+  - **`code`** (string) - The error code, e.g., `missing_authorization_header`.
+  - **`documentation_url`** (string) - A URL to documentation explaining the error.
+  - **`message`** (string) - A human-readable explanation of the error.
+  - **`title`** (string) - A short title for the error.
+  - **`type`** (string) - The type of error, e.g., `authentication_error`.
+- **`meta`** (object) - Metadata about the request.
+  - **`request_id`** (string) - A unique identifier for the request.
+  - **`status`** (integer) - The HTTP status code.
+
+#### Response Example
+
+```json
+{
+  "errors": [
+    {
+      "code": "missing_authorization_header",
+      "documentation_url": "https://duffel.com/docs/api/overview/response-handling",
+      "message": "The 'Authorization' header needs to be set and contain a valid API token.",
+      "title": "Missing authorization header",
+      "type": "authentication_error"
+    }
+  ],
+  "meta": {
+    "request_id": "FZW0H3HdJwKk5HMAAKxB",
+    "status": 401
+  }
+}
+```
+```
+
+--------------------------------
+
+### Install @duffel/components using Yarn
+
+Source: https://duffel.com/docs/guides/ancillaries-component
+
+Installs the Duffel components package using the Yarn package manager.
+
+```Shell
+yarn add @duffel/components
+```
+
+--------------------------------
+
+### Passenger Type Example
+
+Source: https://duffel.com/docs/api/overview/response-handling/order-and-booking-creation
+
+Shows an example of specifying a passenger's type directly in the request, which can sometimes lead to mismatches with airline policies.
+
+```json
+{
+  "data": {
+    "passengers": [
+      {
+        "type": "child"
+      }
+    ]
+  }
+}
+```
+
+--------------------------------
+
+### Duffel API Air Offers GET Request (Node.js)
+
+Source: https://duffel.com/docs/api/offers/schema
+
+Example Node.js code snippet to make a GET request to the Duffel API for air offers. It shows how to construct the URL with query parameters and set necessary headers.
+
+```javascript
+const fetch = require('node-fetch');
+
+async function getAirOffers() {
+  const url = 'https://api.duffel.com/air/offers?after=g2wAAAACbQAAABBBZXJvbWlzdC1LaGFya2l2bQAAAB=&before=g2wAAAACbQAAABBBZXJvbWlzdC1LaGFya2l2bQAAAB=&limit=1&offer_request_id=orq_00009htyDGjIfajdNBZRlw&sort=total_amount&max_connections=0';
+  const headers = {
+    'Accept-Encoding': 'gzip',
+    'Accept': 'application/json',
+    'Duffel-Version': 'v2',
+    'Authorization': 'Bearer <YOUR_ACCESS_TOKEN>'
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: headers
+    });
+    const data = await response.json();
+    console.log(data);
+  } catch (error) {
+    console.error('Error fetching air offers:', error);
+  }
+}
+
+getAirOffers();
+```
+
+--------------------------------
+
+### Order Created Event Example
+
+Source: https://duffel.com/docs/api/v2/webhooks
+
+Example JSON response for the 'order.created' webhook event, indicating a successful order creation.
+
+```json
+{
+  "id": "wev_0000A4tQSmKyqOrcySrGbo",
+  "api_version": "v2",
+  "type": "order.created",
+  "data": {
+    "object": { .. }
+  },
+  "live_mode": true,
+  "idempotency_key": "ord_0000ABd6wggSct7BoraU1o",
+  "created_at": "2020-04-11T15:48:11.642000Z",
+  "identity_organisation_id": "org_0000APMFjhs4X2rJ6k7UIE"
+}
+```
+
+--------------------------------
+
+### Create Duffel Order with Passenger Details (JavaScript)
+
+Source: https://duffel.com/docs/guides/getting-started-with-flights
+
+This snippet demonstrates how to create a booking (order) via the Duffel API. It requires a selected offer ID, payment information (type, currency, amount), and detailed passenger information including name, contact, date of birth, gender, and infant associations. Ensure placeholder IDs and values are replaced with actual data.
+
+```javascript
+duffel.orders.create({
+  selected_offers: [OFFER_ID],
+  payments: [
+    {
+      type: "balance",
+      currency: TOTAL_CURRENCY,
+      amount: TOTAL_AMOUNT
+    }
+  ],
+  passengers: [
+    {
+      phone_number: "+442080160508",
+      email: "tony@example.com",
+      born_on: "1980-07-24",
+      title: "mr",
+      gender: "m",
+      family_name: "Stark",
+      given_name: "Tony",
+      infant_passenger_id: INFANT_PASSENGER_ID,
+      id: ADULT_PASSENGER_ID_1
+    },
+    {
+      phone_number: "+442080160509",
+      email: "potts@example.com",
+      born_on: "1983-11-02",
+      title: "mrs",
+      gender: "m",
+      family_name: "Potts",
+      given_name: "Pepper",
+      id: ADULT_PASSENGER_ID_2
+    },
+    {
+      phone_number: "+442080160506",
+      email: "morgan@example.com",
+      born_on: "2019-08-24",
+      title: "mrs",
+      gender: "f",
+      family_name: "Stark",
+      given_name: "Morgan",
+      id: INFANT_PASSENGER_ID
+    }
+  ]
+})
+```
+
+--------------------------------
+
+### Offer Request Example (JSON)
+
+Source: https://duffel.com/docs/api/v2/offer-requests/create-offer-request
+
+An example of a JSON payload for creating an offer request. This includes defining slices with departure and destination airports, dates, and passenger details.
+
+```json
+{
+  "data": {
+    "slices": [
+      {
+        "origin": "LHR",
+        "destination": "AMS",
+        "departure_date": "2023-10-20"
+      }
+    ],
+    "passengers": [
+      {
+        "type": "adult"
+      }
+    ],
+    "cabin_class": "economy"
+  }
+}
+```
+
+--------------------------------
+
+### Install Duffel Ancillaries Component
+
+Source: https://duffel.com/docs/guides/ancillaries-component
+
+Installs the @duffel/components package using either yarn or npm. This is the first step to integrating the ancillaries component into your project.
+
+```shell
+yarn add @duffel/components
+```
+
+```shell
+npm install @duffel/components
+```
+
+--------------------------------
+
+### Offer Request Data Structure Example
+
+Source: https://duffel.com/docs/api/v2/offer-requests
+
+This JSON snippet shows an example of an offer request object, including details about airports, departure dates, live mode status, creation timestamp, client key, and cabin class.
+
+```json
+{
+  "data": {
+    "slices": [
+      {
+        "origin": "LON",
+        "destination": "NYC",
+        "departure_date": "2020-04-24"
+      }
+    ],
+    "passengers": [
+      {
+        "type": "adult"
+      }
+    ],
+    "cabin_class": "economy"
+  }
+}
+
+```
+
+--------------------------------
+
+### Example: Validation Error
+
+Source: https://duffel.com/docs/api/overview/response-handling
+
+Example response when a required parameter is missing or invalid.
+
+```APIDOC
+## Example: Validation Error
+
+### Description
+This example illustrates a validation error returned when a required parameter is missing or invalid.
+
+### Response Example
+```json
+{
+  "errors": [
+    {
+      "code": "validation_required",
+      "documentation_url": "https://duffel.com/docs/api/overview/response-handling",
+      "message": "Field 'origin' can't be blank",
+      "source": {
+        "field": "origin",
+        "pointer": "/slices/0/origin"
+      },
+      "title": "Required field",
+      "type": "validation_error"
+    }
+  ],
+  "meta": {
+    "request_id": "FZW0cz5rZoJSEekAAK2B",
+    "status": 422
+  }
+}
+```
+```
+
+--------------------------------
+
+### Install Duffel Javascript Library
+
+Source: https://duffel.com/docs/guides/javascript-client-library
+
+Install the Duffel JavaScript client library using a package manager like yarn or npm. This command adds the necessary package to your project dependencies.
+
+```Shell
+yarn add @duffel/api
+```
+
+--------------------------------
+
+### Order Creation Failed Event Example
+
+Source: https://duffel.com/docs/api/v2/webhooks
+
+Example JSON response for the 'order.creation_failed' webhook event, sent when an order creation fails after initial acceptance.
+
+```json
+{
+  "id": "wev_0000A4tQSmKyqOrcySrGbo",
+  "api_version": "v2",
+  "type": "order.creation_failed",
+  "data": {
+    "object": { .. }
+  },
+  "live_mode": true,
+  "idempotency_key": "ZmFpbGVkLXBvcl8wMDAwQW5KMjhnQ0lxU3k5RURDeFRV",
+  "created_at": "2020-04-11T15:48:11.642000Z",
+  "identity_organisation_id": "org_0000APMFjhs4X2rJ6k7UIE"
+}
+```
