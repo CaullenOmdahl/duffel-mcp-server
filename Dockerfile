@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies
 COPY duffel_mcp/pyproject.toml .
-RUN pip install mcp httpx pydantic
+RUN pip install fastmcp httpx pydantic
 
 # Copy server code
 COPY duffel_mcp/server.py .

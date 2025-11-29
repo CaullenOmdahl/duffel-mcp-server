@@ -5,7 +5,7 @@ services:
   - type: web
     name: duffel-mcp
     runtime: python
-    buildCommand: pip install mcp httpx pydantic
+    buildCommand: pip install fastmcp httpx pydantic
     startCommand: python duffel_mcp/server.py --transport sse --host 0.0.0.0 --port $PORT
     envVars:
       - key: DUFFEL_API_KEY_LIVE

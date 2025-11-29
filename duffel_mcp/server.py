@@ -28,7 +28,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 import httpx
 from pydantic import BaseModel, Field, field_validator, ConfigDict
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
 
 # Configure logging to stderr (stdout is reserved for MCP protocol)
 logging.basicConfig(
