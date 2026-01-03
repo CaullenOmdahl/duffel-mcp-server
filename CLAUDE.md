@@ -109,7 +109,7 @@ MCP client config is in `.mcp.json`.
 
 ## Deployment
 
-**Railway:** Deploy via GitHub connection, uses `Dockerfile` with SSE transport on port 8080. Set `CHECKOUT_BASE_URL` to your Railway domain.
+**Railway:** Pushing to `main` branch automatically triggers redeployment via GitHub connection. Uses `Dockerfile` with SSE transport on port 8080. Set `CHECKOUT_BASE_URL` to your Railway domain.
 
 **Docker:** `Dockerfile` runs `server.py --transport sse --host 0.0.0.0 --port 8080`
 
