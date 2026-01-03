@@ -4338,7 +4338,7 @@ def main():
         logger.info("Checkout pages available at http://%s:%d/checkout/{session_id}", args.host, args.port)
 
         # Get the MCP SSE app and combine with checkout routes
-        mcp_sse_app = mcp.sse_app()
+        mcp_sse_app = mcp.http_app(transport="sse")
         combined_app = create_combined_app(mcp_sse_app)
 
         uvicorn.run(
