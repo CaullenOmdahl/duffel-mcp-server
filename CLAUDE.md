@@ -120,3 +120,4 @@ MCP client config is in `.mcp.json`.
 - `ToolError` exception sets MCP `isError` flag
 - Character limit: 25000 (responses truncated with `_truncate_if_needed()`)
 - SSE transport combines MCP routes with Starlette checkout routes via `Mount`
+- **FastMCP SSE API**: Use `mcp.http_app(transport="sse")` to get the ASGI app (not `sse_app()` which is deprecated)
