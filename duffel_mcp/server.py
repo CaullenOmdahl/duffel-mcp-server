@@ -635,6 +635,177 @@ DUFFEL_LINKS_SUCCESS_URL = os.getenv("DUFFEL_LINKS_SUCCESS_URL", "")
 DUFFEL_LINKS_FAILURE_URL = os.getenv("DUFFEL_LINKS_FAILURE_URL", "")
 DUFFEL_LINKS_ABANDONMENT_URL = os.getenv("DUFFEL_LINKS_ABANDONMENT_URL", "")
 
+# Rate Limiting Configuration
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_SESSION_REQUESTS = int(os.getenv("RATE_LIMIT_SESSION_REQUESTS", "20"))  # requests per window per session
+RATE_LIMIT_SESSION_WINDOW = int(os.getenv("RATE_LIMIT_SESSION_WINDOW", "60"))  # window in seconds
+RATE_LIMIT_IP_REQUESTS = int(os.getenv("RATE_LIMIT_IP_REQUESTS", "60"))  # requests per window per IP
+RATE_LIMIT_IP_WINDOW = int(os.getenv("RATE_LIMIT_IP_WINDOW", "60"))  # window in seconds
+RATE_LIMIT_SEARCH_REQUESTS = int(os.getenv("RATE_LIMIT_SEARCH_REQUESTS", "10"))  # flight searches per window per session
+RATE_LIMIT_SEARCH_WINDOW = int(os.getenv("RATE_LIMIT_SEARCH_WINDOW", "60"))  # window in seconds
+
+
+# ============================================================================
+# Rate Limiter (Redis with in-memory fallback)
+# ============================================================================
+
+class RateLimiter:
+    """Rate limiter with Redis backend and in-memory fallback using sliding window."""
+
+    def __init__(self):
+        self._redis_client = None
+        self._use_redis = False
+        self._memory_store: Dict[str, List[float]] = {}  # key -> list of timestamps
+
+        if REDIS_URL:
+            try:
+                import redis
+                self._redis_client = redis.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    socket_connect_timeout=5
+                )
+                self._redis_client.ping()
+                self._use_redis = True
+                logger.info("Rate limiter using Redis")
+            except Exception as e:
+                logger.warning("Rate limiter Redis failed, using in-memory: %s", str(e))
+                self._use_redis = False
+
+        if not self._use_redis:
+            logger.info("Rate limiter using in-memory storage")
+
+    def _rate_limit_key(self, identifier: str, limit_type: str) -> str:
+        """Generate Redis key for rate limit."""
+        return f"rate_limit:{limit_type}:{identifier}"
+
+    def is_rate_limited(self, identifier: str, limit_type: str, max_requests: int, window_seconds: int) -> Tuple[bool, int]:
+        """
+        Check if identifier is rate limited.
+
+        Returns:
+            Tuple of (is_limited, remaining_requests)
+        """
+        if not RATE_LIMIT_ENABLED:
+            return False, max_requests
+
+        now = datetime.utcnow().timestamp()
+        window_start = now - window_seconds
+
+        if self._use_redis:
+            return self._check_redis_rate_limit(identifier, limit_type, max_requests, window_seconds, now, window_start)
+        else:
+            return self._check_memory_rate_limit(identifier, limit_type, max_requests, window_start, now)
+
+    def _check_redis_rate_limit(self, identifier: str, limit_type: str, max_requests: int,
+                                 window_seconds: int, now: float, window_start: float) -> Tuple[bool, int]:
+        """Check rate limit using Redis sorted set."""
+        try:
+            key = self._rate_limit_key(identifier, limit_type)
+            pipe = self._redis_client.pipeline()
+
+            # Remove old entries outside the window
+            pipe.zremrangebyscore(key, 0, window_start)
+            # Count current requests in window
+            pipe.zcard(key)
+            # Add current request
+            pipe.zadd(key, {str(now): now})
+            # Set expiry on the key
+            pipe.expire(key, window_seconds + 1)
+
+            results = pipe.execute()
+            current_count = results[1]  # zcard result
+
+            remaining = max(0, max_requests - current_count - 1)
+            is_limited = current_count >= max_requests
+
+            if is_limited:
+                logger.warning("Rate limit exceeded: %s/%s (count: %d, limit: %d)",
+                             limit_type, identifier, current_count, max_requests)
+
+            return is_limited, remaining
+
+        except Exception as e:
+            logger.error("Redis rate limit check failed: %s", str(e))
+            return self._check_memory_rate_limit(identifier, limit_type, max_requests, window_start, now)
+
+    def _check_memory_rate_limit(self, identifier: str, limit_type: str, max_requests: int,
+                                  window_start: float, now: float) -> Tuple[bool, int]:
+        """Check rate limit using in-memory storage."""
+        key = f"{limit_type}:{identifier}"
+
+        # Initialize if not exists
+        if key not in self._memory_store:
+            self._memory_store[key] = []
+
+        # Remove old entries
+        self._memory_store[key] = [ts for ts in self._memory_store[key] if ts > window_start]
+
+        # Check limit
+        current_count = len(self._memory_store[key])
+        is_limited = current_count >= max_requests
+
+        if not is_limited:
+            self._memory_store[key].append(now)
+        else:
+            logger.warning("Rate limit exceeded: %s/%s (count: %d, limit: %d)",
+                         limit_type, identifier, current_count, max_requests)
+
+        remaining = max(0, max_requests - current_count - 1)
+        return is_limited, remaining
+
+    def record_search(self, session_id: str) -> Tuple[bool, int]:
+        """
+        Record a flight search and check if rate limited.
+        Flight searches have stricter limits to prevent scraping.
+        """
+        return self.is_rate_limited(
+            session_id,
+            "search",
+            RATE_LIMIT_SEARCH_REQUESTS,
+            RATE_LIMIT_SEARCH_WINDOW
+        )
+
+    def check_session(self, session_id: str) -> Tuple[bool, int]:
+        """Check rate limit for a session."""
+        return self.is_rate_limited(
+            session_id,
+            "session",
+            RATE_LIMIT_SESSION_REQUESTS,
+            RATE_LIMIT_SESSION_WINDOW
+        )
+
+    def check_ip(self, ip_address: str) -> Tuple[bool, int]:
+        """Check rate limit for an IP address."""
+        return self.is_rate_limited(
+            ip_address,
+            "ip",
+            RATE_LIMIT_IP_REQUESTS,
+            RATE_LIMIT_IP_WINDOW
+        )
+
+    def cleanup_memory(self):
+        """Cleanup old entries from memory store (called periodically)."""
+        if self._use_redis:
+            return  # Redis handles expiry automatically
+
+        now = datetime.utcnow().timestamp()
+        max_window = max(RATE_LIMIT_SESSION_WINDOW, RATE_LIMIT_IP_WINDOW, RATE_LIMIT_SEARCH_WINDOW)
+        cutoff = now - max_window
+
+        keys_to_delete = []
+        for key, timestamps in self._memory_store.items():
+            self._memory_store[key] = [ts for ts in timestamps if ts > cutoff]
+            if not self._memory_store[key]:
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del self._memory_store[key]
+
+
+# Global rate limiter instance
+rate_limiter = RateLimiter()
+
 
 # ============================================================================
 # Session Storage (Redis with in-memory fallback)
@@ -4279,6 +4450,156 @@ async def duffel_get_booking_link(
 # Main Entry Point
 # ============================================================================
 
+# Known vulnerability scanner paths to block immediately
+SCANNER_PATHS = {
+    ".php", ".asp", ".aspx", ".jsp", ".action", ".do", ".cgi",
+    "/wp-", "/wordpress", "/admin", "/phpmyadmin", "/mysql",
+    "/Public/", "/common/template", "/wap/api", "/leftDao",
+    "/getConfig", "/.env", "/.git", "/config", "/backup",
+    "/shell", "/cmd", "/exec", "/eval", "/system",
+}
+
+# Known malicious user agents
+SCANNER_USER_AGENTS = {
+    "zgrab", "masscan", "nmap", "nikto", "sqlmap", "dirbuster",
+    "gobuster", "wfuzz", "nuclei", "httpx", "curl/", "python-requests",
+}
+
+
+class RateLimitMiddleware:
+    """Starlette middleware for rate limiting and security."""
+
+    def __init__(self, app):
+        self.app = app
+        self._blocked_ips: Dict[str, float] = {}  # IP -> block expiry timestamp
+        self._failed_counts: Dict[str, int] = {}  # IP -> consecutive failed request count
+        self._scanner_hits: Dict[str, int] = {}  # IP -> scanner path hit count
+        self.BLOCK_DURATION = 300  # 5 minutes
+        self.FAILED_THRESHOLD = 10  # Block after 10 failed requests
+        self.SCANNER_BLOCK_THRESHOLD = 3  # Block after 3 scanner-like requests
+
+    def _get_client_ip(self, request: Request) -> str:
+        """Extract client IP from request, handling proxies."""
+        # Check X-Forwarded-For header (Railway/proxy)
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            # Take the first IP in the chain
+            return forwarded.split(",")[0].strip()
+        # Fall back to direct connection
+        if request.client:
+            return request.client.host
+        return "unknown"
+
+    def _is_blocked(self, ip: str) -> bool:
+        """Check if an IP is currently blocked."""
+        if ip in self._blocked_ips:
+            if datetime.utcnow().timestamp() < self._blocked_ips[ip]:
+                return True
+            else:
+                # Block expired
+                del self._blocked_ips[ip]
+                self._failed_counts.pop(ip, None)
+        return False
+
+    def _block_ip(self, ip: str):
+        """Block an IP address."""
+        expiry = datetime.utcnow().timestamp() + self.BLOCK_DURATION
+        self._blocked_ips[ip] = expiry
+        logger.warning("Blocked IP %s for %d seconds due to abuse", ip, self.BLOCK_DURATION)
+
+    def _is_scanner_path(self, path: str) -> bool:
+        """Check if the path looks like a vulnerability scanner probe."""
+        path_lower = path.lower()
+        return any(scanner in path_lower for scanner in SCANNER_PATHS)
+
+    def _is_scanner_ua(self, user_agent: str) -> bool:
+        """Check if the user agent looks like a scanner."""
+        if not user_agent:
+            return False
+        ua_lower = user_agent.lower()
+        return any(scanner in ua_lower for scanner in SCANNER_USER_AGENTS)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
+        client_ip = self._get_client_ip(request)
+        path = request.url.path
+        user_agent = request.headers.get("user-agent", "")
+
+        # Check if IP is blocked
+        if self._is_blocked(client_ip):
+            logger.debug("Rejected request from blocked IP: %s", client_ip)
+            response = JSONResponse(
+                {"error": "Too many requests. Please try again later."},
+                status_code=429
+            )
+            await response(scope, receive, send)
+            return
+
+        # Block scanner user agents immediately
+        if self._is_scanner_ua(user_agent):
+            logger.warning("Blocked scanner user agent from %s: %s", client_ip, user_agent[:50])
+            self._block_ip(client_ip)
+            response = JSONResponse({"error": "Forbidden"}, status_code=403)
+            await response(scope, receive, send)
+            return
+
+        # Detect and block vulnerability scanners by path
+        if self._is_scanner_path(path):
+            self._scanner_hits[client_ip] = self._scanner_hits.get(client_ip, 0) + 1
+            logger.warning("Scanner path detected from %s: %s (hits: %d)",
+                         client_ip, path, self._scanner_hits[client_ip])
+
+            if self._scanner_hits[client_ip] >= self.SCANNER_BLOCK_THRESHOLD:
+                self._block_ip(client_ip)
+                response = JSONResponse({"error": "Forbidden"}, status_code=403)
+                await response(scope, receive, send)
+                return
+
+            # Return 404 but don't process further
+            response = JSONResponse({"error": "Not found"}, status_code=404)
+            await response(scope, receive, send)
+            return
+
+        # Rate limit /messages/ endpoint (MCP messages)
+        if "/messages/" in path:
+            # Extract session_id from query params
+            session_id = request.query_params.get("session_id", "")
+
+            # Check session rate limit
+            if session_id:
+                is_limited, remaining = rate_limiter.check_session(session_id)
+                if is_limited:
+                    logger.warning("Session rate limited: %s from IP %s", session_id, client_ip)
+                    response = JSONResponse(
+                        {"error": "Rate limit exceeded for this session."},
+                        status_code=429
+                    )
+                    await response(scope, receive, send)
+                    return
+
+            # Check IP rate limit
+            is_limited, remaining = rate_limiter.check_ip(client_ip)
+            if is_limited:
+                logger.warning("IP rate limited: %s", client_ip)
+                # Increment failed count for potential blocking
+                self._failed_counts[client_ip] = self._failed_counts.get(client_ip, 0) + 1
+                if self._failed_counts[client_ip] >= self.FAILED_THRESHOLD:
+                    self._block_ip(client_ip)
+                response = JSONResponse(
+                    {"error": "Rate limit exceeded. Please slow down."},
+                    status_code=429
+                )
+                await response(scope, receive, send)
+                return
+
+        # Process the request
+        await self.app(scope, receive, send)
+
+
 def create_combined_app(mcp_app):
     """Create a Starlette app that combines MCP SSE routes with checkout routes."""
     # The checkout routes are served at /checkout/*
@@ -4286,7 +4607,16 @@ def create_combined_app(mcp_app):
     routes = checkout_routes + [
         Mount("/", app=mcp_app),
     ]
-    return Starlette(routes=routes)
+    app = Starlette(routes=routes)
+
+    # Add rate limiting middleware
+    if RATE_LIMIT_ENABLED:
+        logger.info("Rate limiting enabled: %d req/session/%ds, %d req/IP/%ds",
+                   RATE_LIMIT_SESSION_REQUESTS, RATE_LIMIT_SESSION_WINDOW,
+                   RATE_LIMIT_IP_REQUESTS, RATE_LIMIT_IP_WINDOW)
+        return RateLimitMiddleware(app)
+
+    return app
 
 
 def main():
